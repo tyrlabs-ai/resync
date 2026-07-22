@@ -2,6 +2,7 @@ import { access, mkdir, realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { assertCatalog } from "./protocol.js";
 import { git, run } from "./process.js";
+import { reconcileWorkspace } from "./transaction.js";
 
 export function authorizationEnv(token) {
   if (!token) return {};
@@ -68,7 +69,24 @@ export async function materializeProject({ catalogProject, localPath, token, rem
     }
     const remoteOid = await remoteHead(destination, remoteName, catalogProject.sync_branch, env);
     if (!remoteOid) {
-      await git(destination, ["push", remoteName, `HEAD:refs/heads/${catalogProject.sync_branch}`], { env });
+      const head = await git(destination, ["rev-parse", "--verify", "HEAD"], { allowFailure: true });
+      if (head.code === 0) await git(destination, ["push", remoteName, `HEAD:refs/heads/${catalogProject.sync_branch}`], { env });
+    } else {
+      const head = await git(destination, ["rev-parse", "--verify", "HEAD"], { allowFailure: true });
+      if (head.code !== 0) {
+        await git(destination, ["switch", "-c", catalogProject.sync_branch, remoteOid]);
+      } else {
+        const localOid = head.stdout.trim();
+        const remoteIsBase = (await git(destination, ["merge-base", "--is-ancestor", remoteOid, localOid], { allowFailure: true })).code === 0;
+        const localIsBase = (await git(destination, ["merge-base", "--is-ancestor", localOid, remoteOid], { allowFailure: true })).code === 0;
+        if (!remoteIsBase && !localIsBase) {
+          throw new Error("local and hosted histories diverge; RepoSync will not choose a project identity or overwrite either history");
+        }
+        if (localIsBase && localOid !== remoteOid) {
+          const result = await reconcileWorkspace({ projectPath: destination, previousRemoteOid: localOid, targetRemoteOid: remoteOid });
+          if (result.outcome !== "applied") throw new Error(`joining the hosted project conflicts: ${result.detail || result.outcome}`);
+        }
+      }
     }
   }
   const fetchResult = await git(destination, ["fetch", "--no-tags", remoteName,

@@ -14,11 +14,31 @@ Requires Node.js 22+ and Git 2.39+.
 
 ```sh
 npm install -g .
-resync login https://your-resync-host.example DEVICE_TOKEN
-resync subscribe PROJECT_ID /absolute/path/to/checkout
+resync auth login https://your-resync-host.example --token-command 'pass show resync/bootstrap'
+cd /absolute/path/to/checkout
+resync project init --name my-project
 resync daemon
 resync install-adapters PROJECT_ID
 ```
+
+Every command level supports both help spellings and lists its direct commands and options:
+
+```sh
+resync -h
+resync auth --help
+resync project init -h
+```
+
+An ordinary Git clone has no RepoSync identity. Run `resync project init` to give that clone an independent hosted project, `resync project join PROJECT_ID` to join an authorized existing project, or `resync project fork` to separate an enrolled checkout while preserving its Git history.
+
+To enroll another SSH machine in the current project:
+
+```sh
+resync yolopods-t3-peer
+# equivalent to: resync peer sync yolopods-t3-peer
+```
+
+The initiating machine creates a five-minute, one-time join ticket and bootstraps this open-source package over SSH when necessary. The peer generates its own key and credential, joins the same `(service, project_id)`, and receives a distinct checkout ID. Use `host:/path` or `--into /path` to select a remote destination; otherwise RepoSync uses its user-local checkout directory.
 
 In another terminal (or an agent adapter), bracket every participating tool call:
 

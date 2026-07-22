@@ -85,7 +85,7 @@ async function projectJoin(projectId, localPath, provider) {
   if (!selected) throw new Error(`project ${projectId} is not in this device's catalog`);
   const destination = localPath || await repositoryRoot();
   const existingIdentity = await readIdentity(destination).catch(error => {
-    if (localPath && /must run inside/.test(error.message)) return null;
+    if (localPath) return null;
     throw error;
   });
   if (existingIdentity?.projectId && (existingIdentity.projectId !== projectId || existingIdentity.service !== auth.origin)) {
