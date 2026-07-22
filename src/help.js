@@ -23,9 +23,9 @@ export const commandTree = {
     project: {
       description: "Create, join, separate, synchronize, and inspect projects.", usage: "resync project <command>",
       commands: {
-        init: { description: "Create a new synchronization universe for this Git checkout.", usage: "resync project init [options]", options: [["--name <name>", "Hosted project name (defaults to directory name)"], ["--branch <branch>", "Synchronization branch (defaults to current branch)"], ["--provider <url>", "Use a configured provider other than the active provider"]] },
+        init: { description: "Create a new synchronization universe for this Git repository.", usage: "resync project init [options]", options: [["--name <name>", "Hosted project name (defaults to directory name)"], ["--provider <url>", "Use a configured provider other than the active provider"]] },
         join: { description: "Join an authorized existing project with a distinct checkout ID.", usage: "resync project join <project-id> [options]", options: [["--path <path>", "Checkout path (defaults to the current Git worktree)"], ["--provider <url>", "Provider that owns the project"]] },
-        fork: { description: "Create an independent project ID from the current Git state.", usage: "resync project fork [options]", options: [["--name <name>", "Name for the independent hosted project"], ["--branch <branch>", "Synchronization branch"], ["--provider <url>", "Provider for the new project"]] },
+        fork: { description: "Create an independent project ID from the current Git repository.", usage: "resync project fork [options]", options: [["--name <name>", "Name for the independent hosted project"], ["--provider <url>", "Provider for the new project"]] },
         status: { description: "Show freshness, durability, project ID, and checkout ID.", usage: "resync project status [project]" },
         sync: { description: "Fetch and reconcile at an explicit barrier.", usage: "resync project sync [project]" },
         publish: { description: "Validate and publish logical commits without force.", usage: "resync project publish [project]" },

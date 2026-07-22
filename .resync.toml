@@ -1,0 +1,10 @@
+version = 1
+
+[sync]
+poll_interval = "10s"
+preserve_index = true
+conflict_behavior = "pause-writes"
+
+[publish]
+automatic = true
+max_retries = 5

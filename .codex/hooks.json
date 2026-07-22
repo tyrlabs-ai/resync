@@ -1,0 +1,31 @@
+{
+  "description": "RepoSync cooperative workspace leases",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "resync codex-hook 'prj_63a5672563524dc8b723'",
+            "timeout": 3600,
+            "statusMessage": "Refreshing RepoSync workspace"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "resync codex-hook 'prj_63a5672563524dc8b723'",
+            "timeout": 3600,
+            "statusMessage": "Releasing RepoSync workspace"
+          }
+        ]
+      }
+    ]
+  }
+}

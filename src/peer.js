@@ -8,6 +8,7 @@ import { generateDeviceIdentity, loadCredential } from "./credentials.js";
 import { readIdentity, sameProject, writeIdentity } from "./identity.js";
 import { fetchCatalog, materializeProject } from "./remote.js";
 import { ensureProjectConfig } from "./config.js";
+import { currentBranch } from "./git-state.js";
 import { loadCatalog, loadConfig, writeJson, statePaths } from "./state.js";
 import { git, run } from "./process.js";
 import { rpc } from "./rpc.js";
@@ -60,13 +61,15 @@ export async function peerSync(args) {
   let catalog = await fetchCatalog({ server: identity.service, token });
   let project = catalog.projects.find(item => item.project_id === identity.projectId);
   if (!project) throw new Error("current device is no longer authorized for this project");
+  const branch = await currentBranch(identity.root);
   const localHead = (await git(identity.root, ["rev-parse", "HEAD"])).stdout.trim();
-  if (project.advertised_head_oid !== localHead) {
+  const advertisedHead = () => project.advertised_heads.find(head => head.name === branch)?.oid || null;
+  if (advertisedHead() !== localHead) {
     try { await rpc({ method: "publish", project_id: identity.projectId }); }
     catch (error) { throw new Error(`committed work is not published; start the daemon and run \`resync project publish\` before peer sync (${error.message})`); }
     catalog = await fetchCatalog({ server: identity.service, token });
     project = catalog.projects.find(item => item.project_id === identity.projectId);
-    if (project?.advertised_head_oid !== localHead) throw new Error("hosted head did not advance to the current commit");
+    if (!project || advertisedHead() !== localHead) throw new Error(`hosted branch ${branch} did not advance to the current commit`);
   }
 
   const ticket = await providerFetch(ticketEndpoint(discovery, identity.projectId), token, { method: "POST", body: { ttl_seconds: 300 } });
@@ -131,7 +134,7 @@ export async function peerAccept(args) {
   const localProject = await materializeProject({ catalogProject, localPath: destination, token: enrollment.token });
   const identity = await writeIdentity(localProject.localPath, { service: discovery.origin, projectId: project });
   Object.assign(localProject, { service: discovery.origin, checkoutId: identity.checkoutId });
-  await ensureProjectConfig(localProject.localPath, localProject.syncBranch);
+  await ensureProjectConfig(localProject.localPath);
   await persistProject(localProject, catalog.catalog_generation);
   return { projectId: project, service: discovery.origin, checkoutId: identity.checkoutId, localPath: localProject.localPath };
 }

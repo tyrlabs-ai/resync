@@ -11,6 +11,16 @@ import { readProjectConfig } from "./config.js";
 
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
+function migrateProject(project) {
+  project.defaultBranch ||= project.syncBranch || "main";
+  project.advertisedHeads ||= project.advertisedRemoteOid ? { [project.defaultBranch]: project.advertisedRemoteOid } : {};
+  project.lastAppliedHeads ||= project.lastAppliedRemoteOid ? { [project.defaultBranch]: project.lastAppliedRemoteOid } : {};
+  delete project.syncBranch;
+  delete project.advertisedRemoteOid;
+  delete project.lastAppliedRemoteOid;
+  return project;
+}
+
 class LeaseGate {
   constructor(maxLeaseMs = 60 * 60_000) {
     this.leases = new Map();
@@ -89,11 +99,16 @@ export class ResyncDaemon {
       const update = remote.projects.find(item => item.project_id === project.projectId);
       if (!update) continue;
       project.remoteUrl = update.remote_url;
+      project.defaultBranch = update.default_branch;
       project.serverGeneration = update.project_generation;
       try {
         const fetched = await fetchRemote(project, this.config.token);
-        project.advertisedRemoteOid = fetched;
-        if (fetched && fetched !== project.lastAppliedRemoteOid && project.state !== "CONFLICTED") project.state = "REMOTE_AHEAD";
+        project.advertisedHeads = fetched;
+        project.activeBranch = await currentBranch(project.localPath).catch(() => null);
+        const target = project.activeBranch && fetched[project.activeBranch];
+        if (target && target !== project.lastAppliedHeads[project.activeBranch] && project.state !== "CONFLICTED") {
+          project.state = "REMOTE_AHEAD";
+        } else if (project.state !== "CONFLICTED") project.state = "CURRENT";
         project.lastError = null;
       } catch (error) {
         project.state = "OFFLINE";
@@ -104,20 +119,47 @@ export class ResyncDaemon {
   }
 
   async reconcile(project) {
-    if (!project.advertisedRemoteOid || project.advertisedRemoteOid === project.lastAppliedRemoteOid) {
+    const branch = await currentBranch(project.localPath).catch(() => null);
+    if (!branch) throw new Error("detached or unborn HEAD is unsupported in RepoSync V1");
+    project.activeBranch = branch;
+    const target = project.advertisedHeads[branch];
+    if (!target) {
       project.state = "CURRENT";
       return { outcome: "current", changedPaths: [] };
+    }
+    const snapshot = await captureWorkspace(project.localPath);
+    if (snapshot.head === target) {
+      project.lastAppliedHeads[branch] = target;
+      project.state = "CURRENT";
+      return { outcome: "current", changedPaths: [] };
+    }
+    let previous = project.lastAppliedHeads[branch];
+    const targetIsBase = (await git(project.localPath, ["merge-base", "--is-ancestor", target, snapshot.head], { allowFailure: true })).code === 0;
+    if (targetIsBase) {
+      project.lastAppliedHeads[branch] = target;
+      project.state = "CURRENT";
+      return { outcome: "current", changedPaths: [] };
+    }
+    const headIsBase = (await git(project.localPath, ["merge-base", "--is-ancestor", snapshot.head, target], { allowFailure: true })).code === 0;
+    if (!previous || previous === target) {
+      if (headIsBase) previous = snapshot.head;
+      else {
+        project.state = "CONFLICTED";
+        project.conflict = { kind: "diverged-history", detail: `local and hosted histories for branch ${branch} diverge` };
+        await this.persist();
+        return { outcome: "conflict", detail: project.conflict.detail };
+      }
     }
     project.state = "RECONCILING";
     await this.persist();
     const result = await reconcileWorkspace({
       projectPath: project.localPath,
-      previousRemoteOid: project.lastAppliedRemoteOid,
-      targetRemoteOid: project.advertisedRemoteOid,
+      previousRemoteOid: previous,
+      targetRemoteOid: target,
       transactionRoot: this.paths.transactions
     });
     if (result.outcome === "applied") {
-      project.lastAppliedRemoteOid = project.advertisedRemoteOid;
+      project.lastAppliedHeads[branch] = target;
       project.workspaceGeneration += 1;
       project.state = "CURRENT";
       project.conflict = null;
@@ -134,8 +176,7 @@ export class ResyncDaemon {
     if (project.state === "CONFLICTED" || project.state === "FAILED") {
       return { blocked: true, state: project.state.toLowerCase(), model_message: project.conflict?.detail || project.lastError || "workspace unavailable", recovery_actions: ["resync conflicts", "resync recover"] };
     }
-    let reconciliation = { outcome: "current", changedPaths: [] };
-    if (project.state === "REMOTE_AHEAD") reconciliation = await this.gate(project.projectId).runExclusive(() => this.reconcile(project));
+    const reconciliation = await this.gate(project.projectId).runExclusive(() => this.reconcile(project));
     if (project.state === "CONFLICTED") return this.acquire(request);
     const leaseId = await this.gate(project.projectId).activity({ sessionId: request.session_id, callId: request.call_id });
     this.leaseProjects.set(leaseId, project.projectId);
@@ -171,11 +212,11 @@ export class ResyncDaemon {
     return this.gate(project.projectId).runExclusive(async () => {
       for (let attempt = 1; attempt <= 5; attempt += 1) {
         const fetched = await fetchRemote(project, this.config.token);
-        project.advertisedRemoteOid = fetched;
-        if (fetched !== project.lastAppliedRemoteOid) {
-          const result = await this.reconcile(project);
-          if (result.outcome === "conflict") return result;
-        }
+        project.advertisedHeads = fetched;
+        const branch = await currentBranch(project.localPath);
+        if (request.branch && request.branch !== branch) throw new Error(`cannot publish ${request.branch}; active branch is now ${branch}`);
+        const result = await this.reconcile(project);
+        if (result.outcome === "conflict") return result;
         const head = (await git(project.localPath, ["rev-parse", "HEAD"])).stdout.trim();
         const configuration = await readProjectConfig(project.localPath);
         if (configuration.validations.length) {
@@ -193,12 +234,12 @@ export class ResyncDaemon {
         }
         project.durability = "PUBLISHING";
         await this.persist();
-        const pushed = await git(project.localPath, ["push", project.remoteName, `HEAD:refs/heads/${project.syncBranch}`], {
+        const pushed = await git(project.localPath, ["push", project.remoteName, `HEAD:refs/heads/${branch}`], {
           env: authorizationEnv(this.config.token), allowFailure: true
         });
         if (pushed.code === 0) {
-          project.lastAppliedRemoteOid = head;
-          project.advertisedRemoteOid = head;
+          project.lastAppliedHeads[branch] = head;
+          project.advertisedHeads[branch] = head;
           project.state = "CURRENT";
           project.durability = "REMOTELY_DURABLE";
           await this.persist();
@@ -222,7 +263,7 @@ export class ResyncDaemon {
         const project = this.project(request.project_id);
         project.durability = "COMMITTED_UNPUBLISHED";
         await this.persist();
-        setImmediate(() => this.publish({ project_id: project.projectId }).catch(error => {
+        setImmediate(() => this.publish({ project_id: project.projectId, branch: request.branch }).catch(error => {
           project.lastError = error.message;
           this.persist().catch(() => {});
         }));
@@ -235,6 +276,8 @@ export class ResyncDaemon {
   async start() {
     this.config = await loadConfig();
     this.catalog = await loadCatalog();
+    for (const project of this.catalog.projects) migrateProject(project);
+    await this.persist();
     await mkdir(dirname(this.paths.socket), { recursive: true, mode: 0o700 });
     await rm(this.paths.socket, { force: true });
     this.server = createServer(socket => {

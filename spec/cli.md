@@ -46,7 +46,7 @@ Examples:
 
 ```sh
 resync auth login https://provider.example --token-command 'pass show resync/bootstrap'
-resync project init --name api --branch main
+resync project init --name api
 resync project join prj_example
 resync project fork --name isolated-experiment
 resync yolopods-t3-peer

@@ -45,14 +45,17 @@ Unauthenticated liveness/readiness response. It MUST NOT reveal tokens, source, 
     "project_id": "prj_example",
     "name": "example",
     "remote_url": "https://host/git/prj_example.git",
-    "sync_branch": "main",
-    "advertised_head_oid": "0123456789abcdef0123456789abcdef01234567",
+    "default_branch": "main",
+    "advertised_heads": [
+      {"name": "feature/api", "oid": "1111111111111111111111111111111111111111"},
+      {"name": "main", "oid": "0123456789abcdef0123456789abcdef01234567"}
+    ],
     "project_generation": 4
   }]
 }
 ```
 
-The catalog is compact discovery metadata. `advertised_head_oid` MAY be null for an empty repository. Clients fetch only when a project generation or head changes and MUST verify the ref through Git.
+The catalog is compact discovery metadata. `advertised_heads` contains every branch below `refs/heads/*` and is empty for an empty repository. `default_branch` selects an initial checkout only and MUST NOT limit synchronization. Clients MUST verify advertised refs through Git.
 
 ### `POST /v1/projects`
 
@@ -68,7 +71,7 @@ The new machine submits the ticket, its newly generated public key, and a device
 
 ### Git smart HTTP
 
-Repositories are exposed below `/git/<project-id>.git`. The reference host accepts HTTP Basic username `resync` and a device token as the password; an admin bootstrap token is also accepted by the single-tenant reference deployment. Read and write access is checked per project. Only the configured synchronization branch may be updated, and it is fast-forward-only and non-deletable.
+Repositories are exposed below `/git/<project-id>.git`. The reference host accepts HTTP Basic username `resync` and a device token as the password; an admin bootstrap token is also accepted by the single-tenant reference deployment. Read and write access is checked per project. Every branch below `refs/heads/*` may be updated; each is independently fast-forward-only and non-deletable. Other ref namespaces are rejected.
 
 ### Administrative endpoints
 

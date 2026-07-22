@@ -1,6 +1,6 @@
 # RepoSync (`resync`)
 
-RepoSync is an open protocol and Linux-first daemon that keeps one configured Git branch current across coding agents and machines. It continuously fetches changes, then rebases committed, staged, and unstaged local work at cooperative tool-call boundaries. It never changes a managed worktree in the middle of a participating tool call.
+RepoSync is an open protocol and Linux-first daemon that keeps all Git branches synchronized across coding agents and machines. It continuously fetches every branch, then rebases committed, staged, and unstaged local work on the currently checked-out branch at cooperative tool-call boundaries. It never changes a managed worktree in the middle of a participating tool call.
 
 This repository is the public half of the system. It contains the normative V1 specification, protocol types, CLI, daemon, Git transaction engine, and conformance tests. The hosted service is optional: any provider implementing the protocol can supply catalog coordination and a protected Git remote.
 
@@ -59,6 +59,7 @@ Use `resync sync PROJECT_ID` for an explicit compatibility-mode barrier and `res
 - Dirty tracked state is represented as two private synthetic commits, rebased in an isolated worktree, and installed only after the original workspace snapshot is reverified.
 - A failed rebase leaves the active branch, index, and working tree unchanged and retains recovery refs under `refs/resync/recovery/`.
 - Publication uses normal, non-forced pushes. A rejected push triggers fetch/rebase/revalidate/retry.
+- Every `refs/heads/*` branch is transported and protected independently. Fetching an inactive branch updates its remote-tracking ref without changing the worktree; reconciliation occurs when that branch is checked out.
 - Detached processes, editors, and tools that bypass leases are unmanaged. Release builds belong in an immutable checkout or CI.
 
 See [the normative specification](./spec/v1.md), [wire protocol](./spec/protocol.md), and [security model](./SECURITY.md).

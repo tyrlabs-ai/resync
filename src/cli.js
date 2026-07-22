@@ -94,24 +94,26 @@ async function projectJoin(projectId, localPath, provider) {
   const project = await materializeProject({ catalogProject: selected, localPath: destination, token: auth.token });
   const identity = await writeIdentity(project.localPath, { service: auth.origin, projectId });
   Object.assign(project, { service: auth.origin, checkoutId: identity.checkoutId });
-  await ensureProjectConfig(project.localPath, project.syncBranch);
+  await ensureProjectConfig(project.localPath);
   return persistProject(project, remote.catalog_generation);
 }
 
 async function projectInit(args, fork = false) {
-  const { options } = parseOptions(args, { "--name": "string", "--branch": "string", "--provider": "string" });
+  const { options } = parseOptions(args, { "--name": "string", "--provider": "string" });
   const root = await repositoryRoot();
   const prior = await readIdentity(root);
   if (prior.projectId && !fork) throw new Error(`checkout already belongs to ${prior.service} / ${prior.projectId}; use \`resync project fork\` to separate it`);
   const auth = await configuredProvider(options.provider);
-  const branch = options.branch || (await git(root, ["symbolic-ref", "--short", "HEAD"])).stdout.trim();
+  const defaultBranch = (await git(root, ["symbolic-ref", "--short", "HEAD"])).stdout.trim();
   const name = options.name || basename(root);
-  const created = await providerFetch(auth.discovery.endpoints.projects, auth.token, { method: "POST", body: { name, branch } });
+  const created = await providerFetch(auth.discovery.endpoints.projects, auth.token, {
+    method: "POST", body: { name, default_branch: defaultBranch }
+  });
   if (!created?.project_id) throw new Error("provider returned an invalid project creation response");
   const project = await materializeProject({ catalogProject: created, localPath: root, token: auth.token });
   const identity = await writeIdentity(root, { service: auth.origin, projectId: created.project_id });
   Object.assign(project, { service: auth.origin, checkoutId: identity.checkoutId });
-  await ensureProjectConfig(root, project.syncBranch);
+  await ensureProjectConfig(root);
   await persistProject(project);
   return { ...project, operation: fork ? "forked" : "initialized", previousProjectId: prior.projectId || null };
 }
@@ -264,7 +266,7 @@ async function installAdapters(projectId) {
     const existing = await readFile(hookPath, "utf8");
     if (!existing.includes("# RepoSync dispatcher")) await rename(hookPath, previous);
   } catch (error) { if (error.code !== "ENOENT") throw error; }
-  const script = `#!/bin/sh\n# RepoSync dispatcher\nset -u\n[ ! -x \"$0.pre-resync\" ] || \"$0.pre-resync\" \"$@\"\ncommit=\"$(git rev-parse HEAD 2>/dev/null)\" || exit 0\nresync report-commit ${shellQuote(projectId)} \"$commit\" >/dev/null 2>&1 || true\n`;
+  const script = `#!/bin/sh\n# RepoSync dispatcher\nset -u\n[ ! -x \"$0.pre-resync\" ] || \"$0.pre-resync\" \"$@\"\ncommit=\"$(git rev-parse HEAD 2>/dev/null)\" || exit 0\nbranch=\"$(git symbolic-ref --short HEAD 2>/dev/null)\" || exit 0\nresync report-commit ${shellQuote(projectId)} \"$commit\" \"$branch\" >/dev/null 2>&1 || true\n`;
   await writeFile(hookPath, script, { mode: 0o755 });
   await chmod(hookPath, 0o755);
   return { projectId, codexHooks: hooksPath, gitHook: hookPath, requiresCodexTrustReview: true };
@@ -379,7 +381,9 @@ export async function main(input) {
   else if (root === "acquire") result = await rpc({ method: "acquireAccess", project_id: args[1], session_id: args[2] || randomUUID(), call_id: args[3] || randomUUID(), access_hint: "unknown" });
   else if (root === "release") result = await rpc({ method: "releaseAccess", lease_id: args[1], outcome: "success", mutation_hint: "possible" });
   else if (root === "codex-hook") result = await codexHook(args[1]);
-  else if (root === "report-commit") result = await rpc({ method: "reportCommit", project_id: args[1], commit_oid: args[2] });
+  else if (root === "report-commit") result = await rpc({
+    method: "reportCommit", project_id: args[1], commit_oid: args[2], branch: args[3]
+  });
   else {
     // A non-command first argument is the ergonomic `resync <ssh-target>` form.
     if (args.slice(1).some(value => value === "-h" || value === "--help")) { helpFor(["peer", "sync"]); return; }
