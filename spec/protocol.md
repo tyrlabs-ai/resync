@@ -6,6 +6,31 @@ The media/protocol identifier is `resync.v1`. JSON field names on the hosted API
 
 All endpoints use TLS in production and return JSON except Git smart-HTTP paths. Device calls use `Authorization: Bearer <device token>`.
 
+### `GET /.well-known/resync`
+
+Unauthenticated provider discovery document:
+
+```json
+{
+  "protocol": "resync.v1",
+  "service_id": "svc_example",
+  "auth_methods": ["bootstrap-token", "join-ticket"],
+  "endpoints": {
+    "enroll": "/v1/auth/enroll",
+    "catalog": "/v1/catalog",
+    "projects": "/v1/projects",
+    "join_tickets": "/v1/projects/{project_id}/join-tickets",
+    "redeem_join_ticket": "/v1/join-tickets/redeem"
+  }
+}
+```
+
+The CLI resolves relative endpoints against the canonical service origin. Provider-specific browser or OAuth methods may be added to `auth_methods`; an open-source client MUST NOT require provider-specific code when the standard methods are available.
+
+### `POST /v1/auth/enroll`
+
+Authenticated with an operator bootstrap token or an existing device credential allowed to enroll another device. The request supplies a device name and an Ed25519 public key. The response returns a distinct `device_id`, its own bearer credential, and authorized project IDs. The new machine's private key is never transferred.
+
 ### `GET /healthz`
 
 Unauthenticated liveness/readiness response. It MUST NOT reveal tokens, source, or account details.
@@ -29,6 +54,18 @@ Unauthenticated liveness/readiness response. It MUST NOT reveal tokens, source, 
 
 The catalog is compact discovery metadata. `advertised_head_oid` MAY be null for an empty repository. Clients fetch only when a project generation or head changes and MUST verify the ref through Git.
 
+### `POST /v1/projects`
+
+Creates a new synchronization universe for the authenticated account and automatically authorizes the calling device. An existing Git history may seed multiple project IDs intentionally.
+
+### `POST /v1/projects/{project_id}/join-tickets`
+
+Creates a random, single-use, short-lived capability scoped to exactly one service, account, and project. The calling device must already belong to the project and have enrollment permission.
+
+### `POST /v1/join-tickets/redeem`
+
+The new machine submits the ticket, its newly generated public key, and a device name. The service atomically consumes the ticket, enrolls the device only into the ticket's project, and returns that device's own credential. Reuse, expiration, project substitution, and service-origin substitution are errors.
+
 ### Git smart HTTP
 
 Repositories are exposed below `/git/<project-id>.git`. The reference host accepts HTTP Basic username `resync` and a device token as the password; an admin bootstrap token is also accepted by the single-tenant reference deployment. Read and write access is checked per project. Only the configured synchronization branch may be updated, and it is fast-forward-only and non-deletable.
@@ -48,3 +85,17 @@ The daemon listens on a mode-`0600` Unix socket and exchanges newline-delimited 
 A grant contains `lease_id`, `workspace_generation`, `branch_oid`, `reconciliation`, an optional path summary, and an optional model-visible message. A blocked response contains `state`, `model_message`, and `recovery_actions`.
 
 Release uses `releaseAccess` with the lease ID and outcome. Other V1 methods are `status`, `sync`, `publish`, and `ping`. IPC access is local authorization; repository canonicalization and subscription checks scope every request.
+
+## Credential storage contract
+
+Non-secret provider configuration belongs under the user's configuration directory. Device private keys and bearer credentials belong in an interchangeable credential store keyed by canonical service origin and device ID.
+
+Implementations SHOULD prefer an operating-system keychain or configured external credential helper. A headless fallback MAY use files readable only by the operating-system user, but MUST describe that boundary honestly and MUST NOT claim that a key stored beside encrypted data adds protection. Environment credentials MAY be used without persistence in CI.
+
+Private device keys and long-lived account/device credentials MUST NOT be copied during peer synchronization. Only a one-time join ticket crosses the existing SSH channel. Future project encryption keys are separate data-plane material and may be wrapped to the new device public key only after enrollment authorization succeeds.
+
+## SSH peer bootstrap
+
+Running `resync <ssh-target>` inside an enrolled checkout means “enroll the peer in this project and converge it with the same hosted Git repository.” It is not folder mirroring.
+
+The initiating client obtains a join ticket, starts or bootstraps the open-source remote helper over SSH, and asks the helper to redeem the ticket. A target without an explicit path materializes into a deterministic user-local checkout directory keyed by project ID. Existing target paths are accepted only when their empty identity or exact `(service origin, project_id)` is compatible. Different project IDs fail closed.
