@@ -46,16 +46,14 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn remote_target(host: &str) -> Result<String> {
+fn remote_target_with_ssh(ssh: &Path, host: &str) -> Result<String> {
     let output = run(
-        "ssh",
-        [
-            host,
-            "sh",
-            "-c",
-            "printf '%s\\n%s\\n' \"$(uname -s)\" \"$(uname -m)\"",
-        ],
-        RunOptions::default(),
+        ssh,
+        [host, "sh", "-s"],
+        RunOptions {
+            input: Some(b"printf '%s\\n%s\\n' \"$(uname -s)\" \"$(uname -m)\"\n".to_vec()),
+            ..RunOptions::default()
+        },
     )?;
     let values: Vec<&str> = output.stdout.lines().collect();
     let os = values.first().copied().unwrap_or("").to_ascii_lowercase();
@@ -67,6 +65,10 @@ fn remote_target(host: &str) -> Result<String> {
         ("linux", "x86_64" | "amd64") => Ok("x86_64-unknown-linux-gnu".into()),
         _ => bail!("unsupported peer platform {os}/{arch}"),
     }
+}
+
+fn remote_target(host: &str) -> Result<String> {
+    remote_target_with_ssh(Path::new("ssh"), host)
 }
 
 fn current_target() -> Option<&'static str> {
@@ -124,18 +126,42 @@ fn install_remote_binary(host: &str) -> Result<String> {
         env!("CARGO_PKG_VERSION")
     );
     let directory = remote.rsplit_once('/').unwrap().0;
-    let script = format!(
-        "set -eu; mkdir -p {}; temporary={}.tmp; cat >\"$temporary\"; chmod 755 \"$temporary\"; mv \"$temporary\" {}",
-        shell_quote(directory),
-        shell_quote(&remote),
-        shell_quote(&remote)
-    );
-    let options = RunOptions {
-        input: Some(binary),
-        ..RunOptions::default()
-    };
-    run("ssh", [host, "sh", "-c", &script], options)?;
-    Ok(format!("$HOME/{remote}"))
+    run(
+        "ssh",
+        [host, "sh", "-s"],
+        RunOptions {
+            input: Some(format!("set -eu\nmkdir -p {}\n", shell_quote(directory)).into_bytes()),
+            ..RunOptions::default()
+        },
+    )?;
+    let local = tempfile::NamedTempFile::new()?;
+    fs::write(local.path(), binary)?;
+    run(
+        "rsync",
+        [
+            "--".into(),
+            local.path().to_string_lossy().into_owned(),
+            format!("{host}:{remote}.tmp"),
+        ],
+        RunOptions::default(),
+    )?;
+    run(
+        "ssh",
+        [host, "sh", "-s"],
+        RunOptions {
+            input: Some(
+                format!(
+                    "set -eu\nchmod 755 {}\nmv {} {}\n",
+                    shell_quote(&format!("{remote}.tmp")),
+                    shell_quote(&format!("{remote}.tmp")),
+                    shell_quote(&remote)
+                )
+                .into_bytes(),
+            ),
+            ..RunOptions::default()
+        },
+    )?;
+    Ok(format!("\"$HOME\"/{}", shell_quote(&remote)))
 }
 
 fn persist_project(project: LocalProject, generation: Option<u64>) -> Result<()> {
@@ -221,7 +247,7 @@ pub fn peer_sync(
         Some(&json!({ "ttl_seconds": 300 })),
     )?;
     let executable = if no_bootstrap {
-        "resync".into()
+        shell_quote("resync")
     } else {
         install_remote_binary(&host)?
     };
@@ -288,6 +314,24 @@ pub struct AcceptOptions<'a> {
     pub device_name: &'a str,
 }
 
+fn peer_destination(
+    explicit: Option<&Path>,
+    managed_project_path: Option<&Path>,
+    home: Option<&Path>,
+    project_id: &str,
+    project_name: &str,
+) -> PathBuf {
+    explicit
+        .or(managed_project_path)
+        .map(Path::to_owned)
+        .unwrap_or_else(|| {
+            home.unwrap_or_else(|| Path::new("."))
+                .join(".local/share/resync/checkouts")
+                .join(project_id)
+                .join(project_name)
+        })
+}
+
 pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
     let discovery = discover(Some(options.provider))?;
     let key = generate_device_identity(options.device_name)?;
@@ -318,14 +362,17 @@ pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
         .iter()
         .find(|item| item.project_id == options.project_id)
         .context("join ticket did not authorize the expected project")?;
-    let destination = options.into.map(Path::to_owned).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".local/share/resync/checkouts")
-            .join(options.project_id)
-            .join(&selected.name)
-    });
+    let managed_project_path = std::env::var_os("RESYNC_PEER_PROJECT_PATH")
+        .or_else(|| std::env::var_os("YOLOPODS_PROJECT_PATH"))
+        .map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let destination = peer_destination(
+        options.into,
+        managed_project_path.as_deref(),
+        home.as_deref(),
+        options.project_id,
+        &selected.name,
+    );
     if destination.exists() {
         if let Ok(current) = read_identity(&destination) {
             let expected = crate::identity::Identity {
@@ -361,9 +408,12 @@ pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::ticket_endpoint;
+    use super::{peer_destination, remote_target_with_ssh, ticket_endpoint};
     use crate::provider::Discovery;
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     #[test]
     fn ticket_endpoint_substitutes_encoded_templates() {
@@ -380,6 +430,37 @@ mod tests {
         assert_eq!(
             ticket_endpoint(&discovery, "prj_example").unwrap(),
             "https://provider.example/v1/projects/prj_example/join-tickets"
+        );
+    }
+
+    #[test]
+    fn platform_probe_uses_streamed_shell_transport() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let ssh = directory.path().join("ssh");
+        fs::write(
+            &ssh,
+            "#!/bin/sh\ntest \"$1\" = peer\ntest \"$2\" = sh\ntest \"$3\" = -s\ntest \"$#\" -eq 3\ngrep -q 'uname -s'\nprintf 'Linux\\nx86_64\\n'\n",
+        )?;
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755))?;
+
+        assert_eq!(
+            remote_target_with_ssh(&ssh, "peer")?,
+            "x86_64-unknown-linux-gnu"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn peer_destination_prefers_managed_project_path() {
+        assert_eq!(
+            peer_destination(
+                None,
+                Some(Path::new("/home/pod/yolopods")),
+                Some(Path::new("/home/pod")),
+                "prj_example",
+                "yolopods"
+            ),
+            Path::new("/home/pod/yolopods")
         );
     }
 }

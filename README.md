@@ -43,6 +43,10 @@ resync yolopods-t3-peer
 
 The initiating machine creates a five-minute, one-time join ticket and bootstraps this open-source package over SSH when necessary. The peer generates its own key and credential, joins the same `(service, project_id)`, and receives a distinct checkout ID. Use `host:/path` or `--into /path` to select a remote destination; otherwise RepoSync uses its user-local checkout directory.
 
+Managed SSH environments can export `RESYNC_PEER_PROJECT_PATH` to make a bare
+`resync <ssh-target>` enroll their active project checkout. RepoSync also
+recognizes the equivalent `YOLOPODS_PROJECT_PATH` value exported by Yolopods.
+
 In another terminal (or an agent adapter), bracket every participating tool call:
 
 ```sh

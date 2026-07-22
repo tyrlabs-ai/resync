@@ -57,3 +57,7 @@ resync project fork --name isolated-experiment
 resync yolopods-t3-peer
 resync peer sync builder:/work/api
 ```
+
+A peer bootstrap environment MAY export `RESYNC_PEER_PROJECT_PATH` to select
+its active checkout when the caller does not pass an explicit path. The
+Yolopods compatibility variable `YOLOPODS_PROJECT_PATH` has the same behavior.
