@@ -92,6 +92,8 @@ fn ordinary_commit_starts_daemon_and_publishes() -> anyhow::Result<()> {
         &state,
         &["install-adapters", project_id],
     )?;
+    let skill = fs::read_to_string(fixture.local.join(".agents/skills/reposync/SKILL.md"))?;
+    assert!(skill.contains("## RepoSync commit cadence"));
     let _guard = DaemonGuard {
         lock: paths.daemon_lock.clone(),
     };

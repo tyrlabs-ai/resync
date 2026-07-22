@@ -16,11 +16,13 @@ Requires Git 2.39+. Install a prebuilt native binary through npm (Node.js 18+ is
 npm install -g @tyrlabs-ai/resync
 resync auth login https://your-resync-host.example --token-command 'pass show resync/bootstrap'
 cd /absolute/path/to/checkout
-resync project init --name my-project
+resync init --name my-project
 ```
 
-Initialization installs the Git/Codex adapters and starts the per-user daemon
-automatically. The same is true for `join`, `fork`, and SSH peer enrollment.
+Initialization installs the project-local RepoSync skill and Git/Codex adapters,
+then starts the per-user daemon automatically. The same is true for `join`,
+`fork`, and SSH peer enrollment. `install-adapters` and `daemon` are repair and
+diagnostic commands, not normal setup steps.
 
 Every command level supports both help spellings and lists its direct commands and options:
 
@@ -57,7 +59,7 @@ reconciled immediately in the background. If a participating tool call is
 active, installation waits for its lease to end and completes before another
 call is admitted.
 
-Enrollment automatically merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json` and installs a chainable, signal-only Git `post-commit` hook. `install-adapters` remains available as a repair command. A hook starts the daemon if necessary, so a commit notification is not lost merely because no daemon process was already running. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. The pre-tool hook denies a local tool call if the access barrier cannot be reached, while the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
+Enrollment automatically installs the bundled RepoSync skill at `.agents/skills/reposync`, merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json`, and installs a chainable, signal-only Git `post-commit` hook. `install-adapters` remains available as a repair command. A hook starts the daemon if necessary, so a commit notification is not lost merely because no daemon process was already running. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. The pre-tool hook denies a local tool call if the access barrier cannot be reached, while the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
 
 ## Correctness boundary
 

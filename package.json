@@ -4,7 +4,8 @@
   "description": "Open protocol and cooperative Git synchronization daemon for coding agents",
   "type": "module",
   "files": [
-    "bin/resync.js"
+    "bin/resync.js",
+    "skills/reposync"
   ],
   "bin": {
     "resync": "./bin/resync.js"

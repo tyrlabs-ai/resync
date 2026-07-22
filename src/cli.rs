@@ -24,6 +24,9 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+const REPOSYNC_SKILL: &str = include_str!("../skills/reposync/SKILL.md");
+const REPOSYNC_SKILL_OPENAI_METADATA: &str = include_str!("../skills/reposync/agents/openai.yaml");
+
 #[derive(Parser)]
 #[command(
     name = "resync",
@@ -735,6 +738,16 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
     }
     fs::create_dir_all(&codex_directory)?;
     write_json(&hooks_path, &hooks, 0o644)?;
+    let skill_directory = project
+        .local_path
+        .join(".agents")
+        .join("skills")
+        .join("reposync");
+    let skill_path = skill_directory.join("SKILL.md");
+    let skill_metadata_path = skill_directory.join("agents").join("openai.yaml");
+    fs::create_dir_all(skill_metadata_path.parent().unwrap())?;
+    fs::write(&skill_path, REPOSYNC_SKILL)?;
+    fs::write(&skill_metadata_path, REPOSYNC_SKILL_OPENAI_METADATA)?;
     let hook_directory = PathBuf::from(
         git(
             &project.local_path,
@@ -760,7 +773,7 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
     #[cfg(unix)]
     fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755))?;
     Ok(
-        json!({ "projectId": project_id, "codexHooks": hooks_path, "gitHook": hook_path, "requiresCodexTrustReview": true }),
+        json!({ "projectId": project_id, "codexHooks": hooks_path, "codexSkill": skill_path, "gitHook": hook_path, "requiresCodexTrustReview": true }),
     )
 }
 
