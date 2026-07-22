@@ -70,13 +70,8 @@ Project owners can add this block to a managed repository's `AGENTS.md`:
 ```markdown
 ## RepoSync commit cadence
 
-Create a Git commit whenever you complete and test a coherent logical change,
-before beginning the next independent change. For a larger task, commit each
-tested intermediate unit that can be understood and rebased independently.
-Before ending a session, either commit the completed work or clearly report why
-the remaining work is not yet a valid logical commit. Do not combine unrelated
-changes merely to reduce the number of commits, and do not publish a recovery
-checkpoint as if it were a completed logical change.
+RepoSync propagates committed Git history. Commit after completing and testing
+each coherent logical change, before starting the next independent change.
 ```
 
 ## Development

@@ -1,0 +1,4 @@
+interface:
+  display_name: "RepoSync"
+  short_description: "Start and synchronize projects with RepoSync"
+  default_prompt: "Use $reposync to start this project with RepoSync."
