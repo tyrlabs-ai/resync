@@ -72,9 +72,9 @@ impl Catalog {
             let item = project
                 .as_object_mut()
                 .ok_or_else(|| anyhow::anyhow!("catalog project must be an object"))?;
-            if !item
+            if item
                 .get("default_branch")
-                .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                .is_none_or(|v| v.as_str().is_none_or(|s| s.is_empty()))
                 && let Some(value) = item.get("sync_branch").cloned()
             {
                 item.insert("default_branch".into(), value);
