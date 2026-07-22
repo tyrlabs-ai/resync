@@ -39,6 +39,11 @@ test("-h and --help work at every public command level", async () => {
         }
       }
     }
+    for (const alias of ["login", "subscribe", "unsubscribe", "init", "join", "fork", "devices", "status", "sync", "publish", "conflicts", "recover"]) {
+      const result = await invoke([alias, flag]);
+      assert.equal(result.code, 0, `${alias} ${flag}: ${result.stderr}`);
+      assert.match(result.stdout, /Usage:/);
+    }
   }
 });
 

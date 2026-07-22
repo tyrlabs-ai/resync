@@ -340,15 +340,36 @@ export async function main(input) {
 
   // Engineering-preview aliases remain accepted while grouped commands are canonical.
   const aliases = {
-    login: async rest => authLogin([rest[0], "--token", rest[1]]),
+    login: async rest => authLogin(rest[1] ? [rest[0], "--token", rest[1]] : rest),
     subscribe: async rest => projectJoin(rest[0], rest[1]),
     unsubscribe: async rest => unsubscribe(rest[0]),
+    init: async rest => projectInit(rest, false),
+    join: async rest => {
+      const parsed = parseOptions(rest, { "--path": "string", "--provider": "string" });
+      return projectJoin(parsed.positional[0], parsed.options.path, parsed.options.provider);
+    },
+    fork: async rest => projectInit(rest, true),
+    devices: async rest => {
+      if (rest[0] === "revoke") {
+        const parsed = parseOptions(rest.slice(1), { "--provider": "string" });
+        return deviceRevoke(parsed.positional[0], parsed.options.provider);
+      }
+      const parsed = parseOptions(rest, { "--provider": "string" });
+      return deviceList(parsed.options.provider);
+    },
     status: async rest => rpc({ method: "status", project_id: rest[0] }),
     sync: async rest => rpc({ method: "sync", project_id: rest[0] || (await readIdentity()).projectId }),
     publish: async rest => rpc({ method: "publish", project_id: rest[0] || (await readIdentity()).projectId }),
     conflicts: async rest => conflicts(rest[0]),
     recover: async () => recover()
   };
+  const aliasHelp = {
+    login: ["auth", "login"], subscribe: ["project", "join"], unsubscribe: ["project", "leave"],
+    init: ["project", "init"], join: ["project", "join"], fork: ["project", "fork"], devices: ["device"],
+    status: ["project", "status"], sync: ["project", "sync"], publish: ["project", "publish"],
+    conflicts: ["project", "conflicts"], recover: ["project", "recover"]
+  };
+  if (aliasHelp[root] && args.slice(1).some(value => value === "-h" || value === "--help")) { helpFor(aliasHelp[root]); return; }
   if (aliases[root]) { print(await aliases[root](args.slice(1))); return; }
 
   let result;
