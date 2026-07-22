@@ -4,7 +4,7 @@ use common::{fixture, rev};
 use resync::daemon::ResyncDaemon;
 use resync::process::{RunOptions, git};
 use resync::remote::fetch_remote;
-use resync::state::{Config, LocalCatalog, LocalProject, StatePaths};
+use resync::state::{Config, Conflict, LocalCatalog, LocalProject, StatePaths};
 use std::collections::BTreeMap;
 use std::fs;
 use std::time::Duration;
@@ -106,6 +106,67 @@ fn idle_reconciliation_applies_only_current_branch() -> anyhow::Result<()> {
             snapshot.advertised_heads["feature"]
         );
         assert_eq!(rev(&fixture.local, "refs/heads/main")?, main_before);
+        anyhow::Ok(())
+    })
+}
+
+#[test]
+fn current_reconciliation_clears_stale_conflict() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let head = rev(&fixture.local, "HEAD")?;
+    let project = LocalProject {
+        project_id: "prj_stale_conflict".into(),
+        local_path: fixture.local.clone(),
+        remote_url: fixture.remote.to_string_lossy().into_owned(),
+        remote_name: "origin".into(),
+        default_branch: "main".into(),
+        server_generation: 1,
+        advertised_heads: BTreeMap::from([("main".into(), head.clone())]),
+        last_applied_heads: BTreeMap::new(),
+        active_branch: Some("main".into()),
+        workspace_generation: 1,
+        state: "CONFLICTED".into(),
+        durability: "REMOTELY_DURABLE".into(),
+        conflict: Some(Conflict {
+            kind: "reconciliation".into(),
+            detail: "obsolete conflict".into(),
+            paths: Vec::new(),
+        }),
+        last_error: None,
+        service: None,
+        checkout_id: None,
+        extra: BTreeMap::new(),
+    };
+    let root = fixture.root.path().join("state");
+    let paths = StatePaths {
+        config: root.join("config.json"),
+        credentials: root.join("credentials.json"),
+        keys: root.join("keys"),
+        catalog: root.join("catalog.json"),
+        transactions: root.join("transactions"),
+        daemon_lock: root.join("daemon.lock"),
+        socket: root.join("daemon.sock"),
+        root,
+    };
+    let daemon = ResyncDaemon::from_parts(
+        paths,
+        Config::default(),
+        LocalCatalog {
+            catalog_generation: 1,
+            projects: vec![project],
+        },
+        Duration::from_secs(10),
+        Duration::from_secs(60),
+    )?;
+    let runtime = resync::daemon::runtime()?;
+    runtime.block_on(async {
+        assert_eq!(
+            daemon.reconcile_now("prj_stale_conflict").await?.outcome,
+            "current"
+        );
+        let snapshot = daemon.project_snapshot("prj_stale_conflict").await?;
+        assert_eq!(snapshot.state, "CURRENT");
+        assert_eq!(snapshot.conflict, None);
         anyhow::Ok(())
     })
 }

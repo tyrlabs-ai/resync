@@ -298,18 +298,21 @@ impl ResyncDaemon {
         project.active_branch = Some(branch.clone());
         let Some(target) = project.advertised_heads.get(&branch).cloned() else {
             project.state = "CURRENT".into();
+            project.conflict = None;
             return Ok(simple_outcome("current"));
         };
         let snapshot = capture_workspace(&project.local_path)?;
         if snapshot.head == target {
             project.last_applied_heads.insert(branch, target);
             project.state = "CURRENT".into();
+            project.conflict = None;
             return Ok(simple_outcome("current"));
         }
         let target_is_base = is_ancestor(&project.local_path, &target, &snapshot.head)?;
         if target_is_base {
             project.last_applied_heads.insert(branch, target);
             project.state = "CURRENT".into();
+            project.conflict = None;
             return Ok(simple_outcome("current"));
         }
         let head_is_base = is_ancestor(&project.local_path, &snapshot.head, &target)?;
