@@ -1,0 +1,37 @@
+[package]
+name = "resync"
+version = "0.2.0"
+edition = "2024"
+description = "Open protocol and cooperative Git synchronization daemon for coding agents"
+license = "Apache-2.0"
+repository = "https://github.com/tyrlabs-ai/resync"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
+hostname = "0.4"
+libc = "0.2"
+pkcs8 = { version = "0.10", features = ["pem"] }
+rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+tempfile = "3"
+toml = "0.9"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

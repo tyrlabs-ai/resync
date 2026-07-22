@@ -1,4 +1,5 @@
 node_modules/
+target/
 coverage/
 .resync-state/
 *.log
