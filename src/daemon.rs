@@ -47,18 +47,23 @@ impl LeaseGate {
     }
 
     async fn begin_exclusive(&self) {
+        // First serialize exclusive owners. Only the task that changes the flag
+        // from false to true may proceed to the lease-draining phase.
         loop {
             let notified = self.changed.notified();
             {
                 let mut state = self.state.lock().await;
                 if !state.exclusive {
                     state.exclusive = true;
-                    if state.leases.is_empty() {
-                        return;
-                    }
-                } else if state.exclusive && state.leases.is_empty() {
-                    return;
+                    break;
                 }
+            }
+            notified.await;
+        }
+        loop {
+            let notified = self.changed.notified();
+            if self.state.lock().await.leases.is_empty() {
+                return;
             }
             notified.await;
         }
@@ -800,4 +805,42 @@ pub fn daemon_rpc(request: &Value) -> Result<Value> {
             format!("; daemon log: {detail}")
         }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LeaseGate;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn exclusive_owners_are_serialized() {
+        let gate = LeaseGate::new(Duration::from_secs(60));
+        let lease = gate.activity(json!({})).await;
+        let first_gate = Arc::clone(&gate);
+        let mut first = tokio::spawn(async move { first_gate.begin_exclusive().await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!first.is_finished());
+
+        let second_gate = Arc::clone(&gate);
+        let mut second = tokio::spawn(async move { second_gate.begin_exclusive().await });
+        gate.release(&lease).await;
+        tokio::time::timeout(Duration::from_secs(1), &mut first)
+            .await
+            .expect("first owner should acquire the gate")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err()
+        );
+
+        gate.end_exclusive().await;
+        tokio::time::timeout(Duration::from_secs(1), &mut second)
+            .await
+            .expect("second owner should acquire after release")
+            .unwrap();
+        gate.end_exclusive().await;
+    }
 }
