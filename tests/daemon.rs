@@ -10,7 +10,7 @@ use std::fs;
 use std::time::Duration;
 
 #[test]
-fn reconciliation_applies_only_current_branch() -> anyhow::Result<()> {
+fn idle_reconciliation_applies_only_current_branch() -> anyhow::Result<()> {
     let fixture = fixture()?;
     git(&fixture.seed, ["branch", "feature"], RunOptions::default())?;
     git(

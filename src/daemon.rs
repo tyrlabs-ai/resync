@@ -11,7 +11,7 @@ use crate::transaction::{ReconcileResult, reconcile_workspace};
 use anyhow::{Context, Result, bail};
 use rand::Rng;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -109,6 +109,7 @@ struct DaemonInner {
     config: Config,
     catalog: Mutex<LocalCatalog>,
     gates: StdMutex<HashMap<String, Arc<LeaseGate>>>,
+    background_reconciliations: StdMutex<HashSet<String>>,
     lease_projects: Mutex<HashMap<String, String>>,
     poll_interval: Duration,
     max_lease: Duration,
@@ -136,6 +137,7 @@ impl ResyncDaemon {
                 config,
                 catalog: Mutex::new(catalog),
                 gates: StdMutex::new(HashMap::new()),
+                background_reconciliations: StdMutex::new(HashSet::new()),
                 lease_projects: Mutex::new(HashMap::new()),
                 poll_interval,
                 max_lease,
@@ -158,6 +160,7 @@ impl ResyncDaemon {
                 config,
                 catalog: Mutex::new(catalog),
                 gates: StdMutex::new(HashMap::new()),
+                background_reconciliations: StdMutex::new(HashSet::new()),
                 lease_projects: Mutex::new(HashMap::new()),
                 poll_interval,
                 max_lease,
@@ -166,10 +169,7 @@ impl ResyncDaemon {
     }
 
     pub async fn reconcile_now(&self, project_id: &str) -> Result<ReconcileResult> {
-        let mut catalog = self.inner.catalog.lock().await;
-        let result = self.reconcile_project(find_project_mut(&mut catalog, project_id)?)?;
-        self.persist(&catalog).await?;
-        Ok(result)
+        self.reconcile_exclusive(project_id).await
     }
 
     pub async fn project_snapshot(&self, project_id: &str) -> Result<LocalProject> {
@@ -230,7 +230,65 @@ impl ResyncDaemon {
                 }
             }
         }
-        self.persist(&catalog).await
+        let pending = catalog
+            .projects
+            .iter()
+            .filter(|project| project.state == "REMOTE_AHEAD")
+            .map(|project| project.project_id.clone())
+            .collect::<Vec<_>>();
+        self.persist(&catalog).await?;
+        drop(catalog);
+        for project_id in pending {
+            self.schedule_reconcile(project_id);
+        }
+        Ok(())
+    }
+
+    fn schedule_reconcile(&self, project_id: String) {
+        {
+            let mut running = self
+                .inner
+                .background_reconciliations
+                .lock()
+                .expect("background reconciliation lock poisoned");
+            if !running.insert(project_id.clone()) {
+                return;
+            }
+        }
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = daemon.reconcile_exclusive(&project_id).await {
+                let mut catalog = daemon.inner.catalog.lock().await;
+                if let Ok(project) = find_project_mut(&mut catalog, &project_id) {
+                    if project.state == "RECONCILING" {
+                        project.state = "REMOTE_AHEAD".into();
+                    }
+                    project.last_error = Some(format!("{error:#}"));
+                    let _ = daemon.persist(&catalog).await;
+                }
+            }
+            daemon
+                .inner
+                .background_reconciliations
+                .lock()
+                .expect("background reconciliation lock poisoned")
+                .remove(&project_id);
+        });
+    }
+
+    async fn reconcile_exclusive(&self, project_id: &str) -> Result<ReconcileResult> {
+        let gate = self.gate(project_id);
+        gate.begin_exclusive().await;
+        let result = async {
+            let mut catalog = self.inner.catalog.lock().await;
+            let project = find_project_mut(&mut catalog, project_id)?;
+            let result = self.reconcile_project(project);
+            self.persist(&catalog).await?;
+            result
+        }
+        .await;
+        gate.end_exclusive().await;
+        result
     }
 
     fn reconcile_project(&self, project: &mut LocalProject) -> Result<ReconcileResult> {
