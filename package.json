@@ -1,0 +1,21 @@
+{
+  "name": "@reposync/resync",
+  "version": "0.1.0",
+  "description": "Open protocol and cooperative Git synchronization daemon for coding agents",
+  "type": "module",
+  "bin": {
+    "resync": "./bin/resync.js"
+  },
+  "exports": {
+    ".": "./src/protocol.js",
+    "./transaction": "./src/transaction.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check bin/resync.js && node --check src/*.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "Apache-2.0"
+}

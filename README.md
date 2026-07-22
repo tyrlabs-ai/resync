@@ -1,0 +1,69 @@
+# RepoSync (`resync`)
+
+RepoSync is an open protocol and Linux-first daemon that keeps one configured Git branch current across coding agents and machines. It continuously fetches changes, then rebases committed, staged, and unstaged local work at cooperative tool-call boundaries. It never changes a managed worktree in the middle of a participating tool call.
+
+This repository is the public half of the system. It contains the normative V1 specification, protocol types, CLI, daemon, Git transaction engine, and conformance tests. The hosted service is optional: any provider implementing the protocol can supply catalog coordination and a protected Git remote.
+
+## Status
+
+This is a working V1 engineering preview. The transaction engine preserves ordinary tracked files, executable modes, symlinks, staged versus unstaged state, and non-colliding untracked files. It intentionally rejects force-pushed history and untracked-path collisions. Submodules, Git LFS, sparse checkout, merge-heavy unpublished history, intent-to-add entries, arbitrary writers, FUSE, and secret synchronization are outside the current guarantee.
+
+## Quick start
+
+Requires Node.js 22+ and Git 2.39+.
+
+```sh
+npm install -g .
+resync login https://your-resync-host.example DEVICE_TOKEN
+resync subscribe PROJECT_ID /absolute/path/to/checkout
+resync daemon
+resync install-adapters PROJECT_ID
+```
+
+In another terminal (or an agent adapter), bracket every participating tool call:
+
+```sh
+lease_json="$(resync acquire PROJECT_ID SESSION_ID CALL_ID)"
+# Run exactly one agent tool call.
+resync release LEASE_ID
+```
+
+Use `resync sync PROJECT_ID` for an explicit compatibility-mode barrier and `resync publish PROJECT_ID` after a logical commit. The daemon's Unix socket is mode `0600`; its state defaults to `~/.local/state/resync` and can be redirected with `RESYNC_STATE_DIR`.
+
+`install-adapters` merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json` and installs a chainable, signal-only Git `post-commit` hook. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. The pre-tool hook denies a local tool call if the access barrier cannot be reached, while the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
+
+## Correctness boundary
+
+- Fetching never changes the visible worktree.
+- A participating call holds a shared activity lease. Reconciliation holds an exclusive lease.
+- Dirty tracked state is represented as two private synthetic commits, rebased in an isolated worktree, and installed only after the original workspace snapshot is reverified.
+- A failed rebase leaves the active branch, index, and working tree unchanged and retains recovery refs under `refs/resync/recovery/`.
+- Publication uses normal, non-forced pushes. A rejected push triggers fetch/rebase/revalidate/retry.
+- Detached processes, editors, and tools that bypass leases are unmanaged. Release builds belong in an immutable checkout or CI.
+
+See [the normative specification](./spec/v1.md), [wire protocol](./spec/protocol.md), and [security model](./SECURITY.md).
+
+## Agent instruction
+
+Project owners can add this block to a managed repository's `AGENTS.md`:
+
+```markdown
+## RepoSync commit cadence
+
+Create a Git commit whenever you complete and test a coherent logical change,
+before beginning the next independent change. For a larger task, commit each
+tested intermediate unit that can be understood and rebased independently.
+Before ending a session, either commit the completed work or clearly report why
+the remaining work is not yet a valid logical commit. Do not combine unrelated
+changes merely to reduce the number of commits, and do not publish a recovery
+checkpoint as if it were a completed logical change.
+```
+
+## Development
+
+```sh
+npm test
+npm run check
+```
+
+Apache-2.0 licensed. The protocol is designed to permit independent clients and hosting implementations.
