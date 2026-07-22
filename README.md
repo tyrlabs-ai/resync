@@ -51,6 +51,10 @@ resync release LEASE_ID
 
 Ordinary `git commit` is the publication trigger; no RepoSync command is needed afterward. Use `resync sync PROJECT_ID` for an explicit compatibility-mode barrier and `resync publish PROJECT_ID` only to retry or flush publication manually. The daemon's Unix socket is mode `0600`; its state defaults to `~/.local/state/resync` and can be redirected with `RESYNC_STATE_DIR`.
 
+Propagation is symmetric: a commit made in any enrolled checkout is published
+to its branch, fetched by every running machine daemon, and installed in another
+visible worktree at that checkout's next cooperative access boundary.
+
 Enrollment automatically merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json` and installs a chainable, signal-only Git `post-commit` hook. `install-adapters` remains available as a repair command. A hook starts the daemon if necessary, so a commit notification is not lost merely because no daemon process was already running. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. The pre-tool hook denies a local tool call if the access barrier cannot be reached, while the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
 
 ## Correctness boundary
