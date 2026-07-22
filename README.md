@@ -1,6 +1,6 @@
 # RepoSync (`resync`)
 
-RepoSync is an open protocol and Linux-first daemon that keeps all Git branches synchronized across coding agents and machines. It continuously fetches every branch, then rebases committed, staged, and unstaged local work on the currently checked-out branch at cooperative tool-call boundaries. It never changes a managed worktree in the middle of a participating tool call.
+RepoSync is an open protocol and native Rust daemon for macOS and Linux that keeps all Git branches synchronized across coding agents and machines. It continuously fetches every branch, then rebases committed, staged, and unstaged local work on the currently checked-out branch at cooperative tool-call boundaries. It never changes a managed worktree in the middle of a participating tool call.
 
 This repository is the public half of the system. It contains the normative V1 specification, protocol types, CLI, daemon, Git transaction engine, and conformance tests. The hosted service is optional: any provider implementing the protocol can supply catalog coordination and a protected Git remote.
 
@@ -10,10 +10,10 @@ This is a working V1 engineering preview. The transaction engine preserves ordin
 
 ## Quick start
 
-Requires Node.js 22+ and Git 2.39+.
+Requires Git 2.39+. Install a prebuilt native binary through npm (Node.js 18+ is used only by this installer/launcher):
 
 ```sh
-npm install -g .
+npm install -g @tyrlabs-ai/resync
 resync auth login https://your-resync-host.example --token-command 'pass show resync/bootstrap'
 cd /absolute/path/to/checkout
 resync project init --name my-project
@@ -83,8 +83,12 @@ each coherent logical change, before starting the next independent change.
 ## Development
 
 ```sh
-npm test
-npm run check
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --locked
+cargo build --release
 ```
+
+The runtime, protocol implementation, daemon, and tests are Rust. The npm package contains only a small JavaScript launcher that selects the matching native package for Linux x64/ARM64 or macOS Intel/Apple Silicon. Tagged releases build all four binaries on native GitHub-hosted runners; macOS artifacts are intentionally unsigned and not notarized.
 
 Apache-2.0 licensed. The protocol is designed to permit independent clients and hosting implementations.

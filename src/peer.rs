@@ -358,3 +358,28 @@ pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
         json!({ "projectId": options.project_id, "service": discovery.origin, "checkoutId": identity.checkout_id, "localPath": local.local_path }),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ticket_endpoint;
+    use crate::provider::Discovery;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn ticket_endpoint_substitutes_encoded_templates() {
+        let discovery = Discovery {
+            protocol: "resync.v1".into(),
+            service_id: "test".into(),
+            auth_methods: Vec::new(),
+            endpoints: BTreeMap::from([(
+                "join_tickets".into(),
+                "https://provider.example/v1/projects/%7Bproject_id%7D/join-tickets".into(),
+            )]),
+            origin: "https://provider.example".into(),
+        };
+        assert_eq!(
+            ticket_endpoint(&discovery, "prj_example").unwrap(),
+            "https://provider.example/v1/projects/prj_example/join-tickets"
+        );
+    }
+}

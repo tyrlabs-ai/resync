@@ -9,7 +9,7 @@ Use RepoSync to propagate committed Git history between cooperating checkouts wh
 
 ## Start a project
 
-1. Confirm that `resync`, Node.js 22 or newer, and Git 2.39 or newer are available. If working from a RepoSync source checkout and the CLI is missing, install it with `npm install -g .` from that checkout.
+1. Confirm that `resync` and Git 2.39 or newer are available. Install a release with `npm install -g @tyrlabs-ai/resync` (Node.js is only the native-package launcher), or build a source checkout with `cargo install --path .`.
 2. Work from the intended Git repository. Inspect `git status` before changing configuration, preserve existing work, and exclude credentials and runtime state from Git.
 3. Run `resync auth status`. If no suitable provider is configured, enroll with `resync auth login [provider] --token-command '<credential command>'`. Prefer a credential helper or token command over putting secrets directly on the command line.
 4. Choose the identity operation deliberately:

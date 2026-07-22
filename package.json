@@ -1,21 +1,23 @@
 {
-  "name": "@reposync/resync",
+  "name": "@tyrlabs-ai/resync",
   "version": "0.2.0",
   "description": "Open protocol and cooperative Git synchronization daemon for coding agents",
   "type": "module",
+  "files": [
+    "bin/resync.js"
+  ],
   "bin": {
     "resync": "./bin/resync.js"
   },
-  "exports": {
-    ".": "./src/protocol.js",
-    "./transaction": "./src/transaction.js"
-  },
-  "scripts": {
-    "test": "node --test",
-    "check": "node --check bin/resync.js && node --check src/*.js"
+  "optionalDependencies": {
+    "@tyrlabs-ai/resync-darwin-arm64": "0.2.0",
+    "@tyrlabs-ai/resync-darwin-x64": "0.2.0",
+    "@tyrlabs-ai/resync-linux-arm64": "0.2.0",
+    "@tyrlabs-ai/resync-linux-x64": "0.2.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=18"
   },
+  "repository": "github:tyrlabs-ai/resync",
   "license": "Apache-2.0"
 }

@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - run: cp "target/${{ matrix.target }}/release/resync" "resync-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: resync-${{ matrix.target }}
+          path: resync-${{ matrix.target }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: resync-*
+          path: dist
+          merge-multiple: true
+      - name: Validate version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test "$(node -p 'require("./package.json").version')" = "$version"
+          for manifest in npm/*/package.json; do
+            test "$(node -p "require('./$manifest').version")" = "$version"
+          done
+      - name: Create checksums and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod 755 dist/resync-*
+          (cd dist && sha256sum resync-* > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+      - name: Assemble npm platform packages
+        run: |
+          mkdir -p npm/linux-x64/bin npm/linux-arm64/bin npm/darwin-x64/bin npm/darwin-arm64/bin
+          cp dist/resync-x86_64-unknown-linux-gnu npm/linux-x64/bin/resync
+          cp dist/resync-aarch64-unknown-linux-gnu npm/linux-arm64/bin/resync
+          cp dist/resync-x86_64-apple-darwin npm/darwin-x64/bin/resync
+          cp dist/resync-aarch64-apple-darwin npm/darwin-arm64/bin/resync
+          chmod 755 npm/*/bin/resync
+      - name: Publish npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for package in npm/linux-x64 npm/linux-arm64 npm/darwin-x64 npm/darwin-arm64; do
+            npm publish "$package" --access public
+          done
+          npm publish --access public
