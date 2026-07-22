@@ -2,7 +2,7 @@
 name = "resync"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Open protocol and cooperative Git synchronization daemon for coding agents"
 license = "Apache-2.0"
 repository = "https://github.com/tyrlabs-ai/resync"

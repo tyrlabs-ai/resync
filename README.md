@@ -97,6 +97,6 @@ cargo test --locked
 cargo build --release
 ```
 
-The runtime, protocol implementation, daemon, and tests are Rust. The npm package contains only a small JavaScript launcher that selects the matching native package for Linux x64/ARM64 or macOS Intel/Apple Silicon. Tagged releases build all four binaries on native GitHub-hosted runners; macOS artifacts are intentionally unsigned and not notarized.
+The runtime, protocol implementation, daemon, and tests are Rust 1.88+. The npm package contains only a small JavaScript launcher that selects the matching native package for Linux x64/ARM64 or macOS Intel/Apple Silicon. Linux release binaries are statically linked with musl so they do not inherit the build runner's glibc requirement. Tagged releases build all four binaries on native GitHub-hosted runners; macOS artifacts are intentionally unsigned and not notarized.
 
 Apache-2.0 licensed. The protocol is designed to permit independent clients and hosting implementations.
