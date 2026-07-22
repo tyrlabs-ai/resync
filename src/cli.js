@@ -1,57 +1,119 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { hostname } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { ensureProjectConfig } from "./config.js";
+import { canonicalOrigin, eraseCredential, loadCredential, removeDeviceIdentity } from "./credentials.js";
 import { runDaemon } from "./daemon.js";
+import { commandTree, parseOptions, renderHelp } from "./help.js";
+import { clearIdentity, readIdentity, repositoryRoot, writeIdentity } from "./identity.js";
+import { DEFAULT_PROVIDER, discover, enrollWithToken, providerFetch } from "./provider.js";
 import { fetchCatalog, materializeProject } from "./remote.js";
 import { rpc } from "./rpc.js";
 import { loadCatalog, loadConfig, statePaths, writeJson } from "./state.js";
 import { recoverTransaction } from "./transaction.js";
-
-const help = `RepoSync cooperative continuous rebase
-
-Usage:
-  resync login <server-url> <device-token>
-  resync subscribe <project-id> <local-path>
-  resync unsubscribe <project-id>
-  resync daemon
-  resync status [project-id]
-  resync sync <project-id>
-  resync publish <project-id>
-  resync acquire <project-id> [session-id] [call-id]
-  resync release <lease-id>
-  resync install-adapters <project-id>
-  resync codex-hook <project-id>       # invoked by Codex hooks on stdin
-  resync report-commit <project-id>    # invoked by the Git hook
-  resync conflicts [project-id]
-  resync recover
-  resync doctor
-`;
+import { git, run } from "./process.js";
 
 function print(value) { process.stdout.write(`${JSON.stringify(value, null, 2)}\n`); }
 
-async function login(server, token) {
-  if (!server || !token) throw new Error("usage: resync login <server-url> <device-token>");
-  const config = { protocol: "resync.v1", server: new URL(server).origin, token };
-  await fetchCatalog(config);
-  await writeJson(statePaths().config, config);
-  return { server: config.server, authenticated: true };
+async function configuredProvider(provider) {
+  const config = await loadConfig();
+  const origin = canonicalOrigin(provider || config.activeProvider || DEFAULT_PROVIDER);
+  const token = await loadCredential(origin) || (config.server === origin ? config.token : null);
+  if (!token) throw new Error(`not logged in to ${origin}; run \`resync auth login ${origin}\``);
+  return { config, origin, token, discovery: await discover(origin) };
 }
 
-async function subscribe(projectId, localPath) {
-  if (!projectId || !localPath) throw new Error("usage: resync subscribe <project-id> <local-path>");
+async function authLogin(args) {
+  const { options, positional } = parseOptions(args, { "--token": "string", "--token-command": "string", "--device-name": "string" });
+  const provider = positional[0] || DEFAULT_PROVIDER;
+  let token = options.token || process.env.RESYNC_BOOTSTRAP_TOKEN;
+  if (options.token_command) {
+    const result = await run("/bin/sh", ["-c", options.token_command]);
+    token = result.stdout.trim();
+  }
+  // Compatibility with the original `resync login SERVER TOKEN` spelling.
+  token ||= positional[1];
+  if (!token) throw new Error("login requires --token, --token-command, or RESYNC_BOOTSTRAP_TOKEN");
+  return enrollWithToken({ provider, bootstrapToken: token, deviceName: options.device_name || hostname() });
+}
+
+async function authStatus(provider) {
   const config = await loadConfig();
-  const remote = await fetchCatalog(config);
-  const selected = remote.projects.find(project => project.project_id === projectId);
-  if (!selected) throw new Error(`project ${projectId} is not in this device's catalog`);
-  const project = await materializeProject({ catalogProject: selected, localPath, token: config.token });
-  await ensureProjectConfig(project.localPath, project.syncBranch);
+  const origins = provider ? [canonicalOrigin(provider)] : Object.keys(config.providers || {});
+  return {
+    activeProvider: config.activeProvider,
+    providers: await Promise.all(origins.map(async origin => ({
+      ...config.providers[origin],
+      origin,
+      active: origin === config.activeProvider,
+      credentialAvailable: Boolean(await loadCredential(origin))
+    })))
+  };
+}
+
+async function authLogout(args) {
+  const { options, positional } = parseOptions(args, { "--all": "boolean" });
+  const config = await loadConfig();
+  const origins = options.all ? Object.keys(config.providers || {}) : [canonicalOrigin(positional[0] || config.activeProvider || DEFAULT_PROVIDER)];
+  for (const origin of origins) {
+    await eraseCredential(origin);
+    await removeDeviceIdentity(config.providers?.[origin]?.publicKeyPath);
+    if (config.providers) delete config.providers[origin];
+  }
+  if (origins.includes(config.activeProvider)) config.activeProvider = Object.keys(config.providers || {})[0] || null;
+  delete config.server;
+  delete config.token;
+  await writeJson(statePaths().config, config, 0o600);
+  return { loggedOut: origins, activeProvider: config.activeProvider };
+}
+
+async function persistProject(project, remoteCatalogGeneration) {
   const catalog = await loadCatalog();
-  catalog.projects = catalog.projects.filter(item => item.projectId !== projectId && item.localPath !== project.localPath);
+  catalog.projects = catalog.projects.filter(item => item.projectId !== project.projectId && item.localPath !== project.localPath);
   catalog.projects.push(project);
-  catalog.catalogGeneration = remote.catalog_generation;
+  if (remoteCatalogGeneration != null) catalog.catalogGeneration = remoteCatalogGeneration;
   await writeJson(statePaths().catalog, catalog);
   return project;
+}
+
+async function projectJoin(projectId, localPath, provider) {
+  if (!projectId) throw new Error("project join requires a project ID");
+  const auth = await configuredProvider(provider);
+  const remote = await fetchCatalog({ server: auth.origin, token: auth.token });
+  const selected = remote.projects.find(project => project.project_id === projectId);
+  if (!selected) throw new Error(`project ${projectId} is not in this device's catalog`);
+  const destination = localPath || await repositoryRoot();
+  const existingIdentity = await readIdentity(destination).catch(error => {
+    if (localPath && /must run inside/.test(error.message)) return null;
+    throw error;
+  });
+  if (existingIdentity?.projectId && (existingIdentity.projectId !== projectId || existingIdentity.service !== auth.origin)) {
+    throw new Error(`checkout already belongs to ${existingIdentity.service} / ${existingIdentity.projectId}; use \`resync project fork\` for an independent project`);
+  }
+  const project = await materializeProject({ catalogProject: selected, localPath: destination, token: auth.token });
+  const identity = await writeIdentity(project.localPath, { service: auth.origin, projectId });
+  Object.assign(project, { service: auth.origin, checkoutId: identity.checkoutId });
+  await ensureProjectConfig(project.localPath, project.syncBranch);
+  return persistProject(project, remote.catalog_generation);
+}
+
+async function projectInit(args, fork = false) {
+  const { options } = parseOptions(args, { "--name": "string", "--branch": "string", "--provider": "string" });
+  const root = await repositoryRoot();
+  const prior = await readIdentity(root);
+  if (prior.projectId && !fork) throw new Error(`checkout already belongs to ${prior.service} / ${prior.projectId}; use \`resync project fork\` to separate it`);
+  const auth = await configuredProvider(options.provider);
+  const branch = options.branch || (await git(root, ["symbolic-ref", "--short", "HEAD"])).stdout.trim();
+  const name = options.name || basename(root);
+  const created = await providerFetch(auth.discovery.endpoints.projects, auth.token, { method: "POST", body: { name, branch } });
+  if (!created?.project_id) throw new Error("provider returned an invalid project creation response");
+  const project = await materializeProject({ catalogProject: created, localPath: root, token: auth.token });
+  const identity = await writeIdentity(root, { service: auth.origin, projectId: created.project_id });
+  Object.assign(project, { service: auth.origin, checkoutId: identity.checkoutId });
+  await ensureProjectConfig(root, project.syncBranch);
+  await persistProject(project);
+  return { ...project, operation: fork ? "forked" : "initialized", previousProjectId: prior.projectId || null };
 }
 
 async function unsubscribe(projectId) {
@@ -60,7 +122,21 @@ async function unsubscribe(projectId) {
   catalog.projects = catalog.projects.filter(project => project.projectId !== projectId);
   if (catalog.projects.length === before) throw new Error(`project ${projectId} is not subscribed`);
   await writeJson(statePaths().catalog, catalog);
+  const identity = await readIdentity().catch(() => null);
+  if (identity?.projectId === projectId) await clearIdentity(identity.root);
   return { unsubscribed: projectId, filesPreserved: true };
+}
+
+async function deviceList(provider) {
+  const auth = await configuredProvider(provider);
+  return providerFetch(auth.discovery.endpoints.devices || new URL("/v1/devices", auth.origin), auth.token);
+}
+
+async function deviceRevoke(deviceId, provider) {
+  if (!deviceId) throw new Error("device revoke requires a device ID");
+  const auth = await configuredProvider(provider);
+  const base = auth.discovery.endpoints.devices || new URL("/v1/devices", auth.origin);
+  return providerFetch(new URL(`${String(base).replace(/\/$/, "")}/${encodeURIComponent(deviceId)}/revoke`), auth.token, { method: "POST" });
 }
 
 async function conflicts(projectId) {
@@ -194,32 +270,102 @@ async function installAdapters(projectId) {
   return { projectId, codexHooks: hooksPath, gitHook: hookPath, requiresCodexTrustReview: true };
 }
 
-export async function main(args) {
-  const [command, ...rest] = args;
-  if (!command || command === "help" || command === "--help" || command === "-h") {
-    process.stdout.write(help);
+function helpFor(path) {
+  let node = commandTree;
+  for (const part of path) node = node.commands?.[part];
+  process.stdout.write(renderHelp({ ...node, name: ["resync", ...path].join(" ") }));
+}
+
+async function dispatch(group, command, args) {
+  let result;
+  if (group === "auth") {
+    if (command === "login") result = await authLogin(args);
+    else if (command === "status") result = await authStatus(parseOptions(args).positional[0]);
+    else if (command === "logout") result = await authLogout(args);
+  } else if (group === "project") {
+    if (command === "init") result = await projectInit(args, false);
+    else if (command === "fork") result = await projectInit(args, true);
+    else if (command === "join") {
+      const parsed = parseOptions(args, { "--path": "string", "--provider": "string" });
+      result = await projectJoin(parsed.positional[0], parsed.options.path, parsed.options.provider);
+    } else if (command === "leave") result = await unsubscribe(parseOptions(args).positional[0] || (await readIdentity()).projectId);
+    else if (command === "status") result = await rpc({ method: "status", project_id: parseOptions(args).positional[0] });
+    else if (command === "sync") result = await rpc({ method: "sync", project_id: parseOptions(args).positional[0] || (await readIdentity()).projectId });
+    else if (command === "publish") result = await rpc({ method: "publish", project_id: parseOptions(args).positional[0] || (await readIdentity()).projectId });
+    else if (command === "conflicts") result = await conflicts(parseOptions(args).positional[0]);
+    else if (command === "recover") result = await recover();
+  } else if (group === "device") {
+    const parsed = parseOptions(args, { "--provider": "string" });
+    if (command === "list") result = await deviceList(parsed.options.provider);
+    else if (command === "revoke") result = await deviceRevoke(parsed.positional[0], parsed.options.provider);
+  } else if (group === "peer") {
+    const peer = await import("./peer.js");
+    if (command === "sync") result = await peer.peerSync(args);
+    else if (command === "accept") result = await peer.peerAccept(args);
+  }
+  if (result === undefined) throw new Error(`unimplemented command: ${group} ${command}`);
+  return result;
+}
+
+function extractGlobals(input) {
+  const args = [...input];
+  for (let index = 0; index < args.length;) {
+    if (args[index] === "--state-dir") {
+      if (!args[index + 1]) throw new Error("--state-dir requires a value");
+      process.env.RESYNC_STATE_DIR = resolve(args[index + 1]);
+      args.splice(index, 2);
+    } else if (args[index].startsWith("--state-dir=")) {
+      process.env.RESYNC_STATE_DIR = resolve(args[index].slice("--state-dir=".length));
+      args.splice(index, 1);
+    } else index += 1;
+  }
+  return args;
+}
+
+export async function main(input) {
+  const args = extractGlobals(input);
+  if (args.includes("--version")) { process.stdout.write("resync 0.2.0 (protocol resync.v1)\n"); return; }
+  if (!args.length || args[0] === "help" || args[0] === "-h" || args[0] === "--help") { helpFor([]); return; }
+  const root = args[0];
+  const groupNode = commandTree.commands[root];
+  if (groupNode?.commands) {
+    if (args.length === 1 || ["-h", "--help", "help"].includes(args[1])) { helpFor([root]); return; }
+    const command = args[1];
+    if (!groupNode.commands[command]) throw new Error(`unknown ${root} command ${command}\n\n${renderHelp({ ...groupNode, name: `resync ${root}` })}`);
+    if (args.slice(2).some(value => value === "-h" || value === "--help")) { helpFor([root, command]); return; }
+    print(await dispatch(root, command, args.slice(2)));
     return;
   }
+  if (groupNode && args.slice(1).some(value => value === "-h" || value === "--help")) { helpFor([root]); return; }
+
+  // Engineering-preview aliases remain accepted while grouped commands are canonical.
+  const aliases = {
+    login: async rest => authLogin([rest[0], "--token", rest[1]]),
+    subscribe: async rest => projectJoin(rest[0], rest[1]),
+    unsubscribe: async rest => unsubscribe(rest[0]),
+    status: async rest => rpc({ method: "status", project_id: rest[0] }),
+    sync: async rest => rpc({ method: "sync", project_id: rest[0] || (await readIdentity()).projectId }),
+    publish: async rest => rpc({ method: "publish", project_id: rest[0] || (await readIdentity()).projectId }),
+    conflicts: async rest => conflicts(rest[0]),
+    recover: async () => recover()
+  };
+  if (aliases[root]) { print(await aliases[root](args.slice(1))); return; }
+
   let result;
-  switch (command) {
-    case "login": result = await login(rest[0], rest[1]); break;
-    case "subscribe": result = await subscribe(rest[0], rest[1]); break;
-    case "unsubscribe": result = await unsubscribe(rest[0]); break;
-    case "daemon": await runDaemon(); return;
-    case "status": result = await rpc({ method: "status", project_id: rest[0] }); break;
-    case "sync": result = await rpc({ method: "sync", project_id: rest[0] }); break;
-    case "publish": result = await rpc({ method: "publish", project_id: rest[0] }); break;
-    case "acquire": result = await rpc({
-      method: "acquireAccess", project_id: rest[0], session_id: rest[1] || randomUUID(), call_id: rest[2] || randomUUID(), access_hint: "unknown"
-    }); break;
-    case "release": result = await rpc({ method: "releaseAccess", lease_id: rest[0], outcome: "success", mutation_hint: "possible" }); break;
-    case "install-adapters": result = await installAdapters(rest[0]); break;
-    case "codex-hook": result = await codexHook(rest[0]); break;
-    case "report-commit": result = await rpc({ method: "reportCommit", project_id: rest[0], commit_oid: rest[1] }); break;
-    case "conflicts": result = await conflicts(rest[0]); break;
-    case "recover": result = await recover(); break;
-    case "doctor": result = await doctor(); break;
-    default: throw new Error(`unknown command ${command}\n\n${help}`);
+  if (root === "daemon") { await runDaemon(); return; }
+  else if (root === "doctor") result = await doctor();
+  else if (root === "install-adapters") result = await installAdapters(args[1]);
+  else if (root === "acquire") result = await rpc({ method: "acquireAccess", project_id: args[1], session_id: args[2] || randomUUID(), call_id: args[3] || randomUUID(), access_hint: "unknown" });
+  else if (root === "release") result = await rpc({ method: "releaseAccess", lease_id: args[1], outcome: "success", mutation_hint: "possible" });
+  else if (root === "codex-hook") result = await codexHook(args[1]);
+  else if (root === "report-commit") result = await rpc({ method: "reportCommit", project_id: args[1], commit_oid: args[2] });
+  else {
+    // A non-command first argument is the ergonomic `resync <ssh-target>` form.
+    if (args.slice(1).some(value => value === "-h" || value === "--help")) { helpFor(["peer", "sync"]); return; }
+    const identity = await readIdentity().catch(() => null);
+    if (!identity?.projectId) throw new Error(`unknown command ${root}; run \`resync --help\``);
+    const peer = await import("./peer.js");
+    result = await peer.peerSync([root, ...args.slice(1)]);
   }
   print(result);
 }

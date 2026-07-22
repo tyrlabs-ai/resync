@@ -1,6 +1,6 @@
 {
   "name": "@reposync/resync",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Open protocol and cooperative Git synchronization daemon for coding agents",
   "type": "module",
   "bin": {

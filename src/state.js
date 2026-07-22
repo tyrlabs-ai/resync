@@ -11,6 +11,8 @@ export function statePaths() {
   return {
     root,
     config: join(root, "config.json"),
+    credentials: join(root, "credentials.json"),
+    keys: join(root, "keys"),
     catalog: join(root, "catalog.json"),
     transactions: join(root, "transactions"),
     socket: process.env.RESYNC_SOCKET || join(root, "daemon.sock")
@@ -35,7 +37,17 @@ export async function writeJson(path, value, mode = 0o600) {
 }
 
 export async function loadConfig() {
-  return readJson(statePaths().config, { protocol: "resync.v1", server: null, token: null });
+  const config = await readJson(statePaths().config, { protocol: "resync.v1", activeProvider: null, providers: {} });
+  // Read the engineering-preview shape without forcing users to log in again.
+  if (config.server && !config.activeProvider) {
+    const origin = new URL(config.server).origin;
+    config.activeProvider = origin;
+    config.providers = { [origin]: { origin, deviceId: null, deviceName: "legacy device", publicKeyPath: null } };
+  }
+  const { loadCredential } = await import("./credentials.js");
+  const origin = config.activeProvider;
+  const token = origin ? (await loadCredential(origin)) || config.token || null : null;
+  return { ...config, server: origin, token };
 }
 
 export async function loadCatalog() {
