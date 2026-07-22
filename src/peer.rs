@@ -46,6 +46,10 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn remote_home_path(relative: &str) -> String {
+    format!("\"$HOME\"/{}", shell_quote(relative))
+}
+
 fn remote_target_with_ssh(ssh: &Path, host: &str) -> Result<String> {
     let output = run(
         ssh,
@@ -130,7 +134,9 @@ fn install_remote_binary(host: &str) -> Result<String> {
         "ssh",
         [host, "sh", "-s"],
         RunOptions {
-            input: Some(format!("set -eu\nmkdir -p {}\n", shell_quote(directory)).into_bytes()),
+            input: Some(
+                format!("set -eu\nmkdir -p {}\n", remote_home_path(directory)).into_bytes(),
+            ),
             ..RunOptions::default()
         },
     )?;
@@ -152,16 +158,16 @@ fn install_remote_binary(host: &str) -> Result<String> {
             input: Some(
                 format!(
                     "set -eu\nchmod 755 {}\nmv {} {}\n",
-                    shell_quote(&format!("{remote}.tmp")),
-                    shell_quote(&format!("{remote}.tmp")),
-                    shell_quote(&remote)
+                    remote_home_path(&format!("{remote}.tmp")),
+                    remote_home_path(&format!("{remote}.tmp")),
+                    remote_home_path(&remote)
                 )
                 .into_bytes(),
             ),
             ..RunOptions::default()
         },
     )?;
-    Ok(format!("\"$HOME\"/{}", shell_quote(&remote)))
+    Ok(remote_home_path(&remote))
 }
 
 fn persist_project(project: LocalProject, generation: Option<u64>) -> Result<()> {
@@ -408,7 +414,7 @@ pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{peer_destination, remote_target_with_ssh, ticket_endpoint};
+    use super::{peer_destination, remote_home_path, remote_target_with_ssh, ticket_endpoint};
     use crate::provider::Discovery;
     use std::collections::BTreeMap;
     use std::fs;
@@ -461,6 +467,14 @@ mod tests {
                 "yolopods"
             ),
             Path::new("/home/pod/yolopods")
+        );
+    }
+
+    #[test]
+    fn bootstrap_paths_are_rooted_in_remote_home() {
+        assert_eq!(
+            remote_home_path(".local/share/resync/bin/0.2.0"),
+            "\"$HOME\"/'.local/share/resync/bin/0.2.0'"
         );
     }
 }
