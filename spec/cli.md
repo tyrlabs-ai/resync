@@ -37,10 +37,15 @@ peer
 
 daemon
 doctor
-install-adapters <project>
+install-adapters <project>           # repair/reinstall; enrollment does this automatically
 ```
 
 Compatibility aliases from the engineering preview MAY remain, but grouped commands are canonical. A non-command first positional value is treated as an SSH target only while inside an enrolled Git checkout; unknown command-like values outside that context produce help and an error.
+
+`init`, `join`, `fork`, and peer enrollment install lifecycle adapters and
+ensure the per-user daemon is running. An ordinary `git commit` schedules
+publication automatically. `project publish` is an explicit retry/flush
+command and is not part of the normal workflow.
 
 Examples:
 

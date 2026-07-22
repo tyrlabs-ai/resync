@@ -1,4 +1,4 @@
-import { chmod, mkdir, rm } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
@@ -254,6 +254,12 @@ export class ResyncDaemon {
   async handle(request) {
     switch (request.method) {
       case "ping": return { protocol: "resync.v1", pid: process.pid };
+      case "reload": {
+        this.catalog = await loadCatalog();
+        for (const project of this.catalog.projects) migrateProject(project);
+        await this.refresh();
+        return { reloaded: this.catalog.projects.length };
+      }
       case "status": return { projects: request.project_id ? [this.project(request.project_id)] : this.catalog.projects };
       case "acquireAccess": return this.acquire(request);
       case "releaseAccess": return this.release(request);
@@ -279,6 +285,7 @@ export class ResyncDaemon {
     for (const project of this.catalog.projects) migrateProject(project);
     await this.persist();
     await mkdir(dirname(this.paths.socket), { recursive: true, mode: 0o700 });
+    await this.acquireProcessLock();
     await rm(this.paths.socket, { force: true });
     this.server = createServer(socket => {
       let buffered = "";
@@ -321,6 +328,35 @@ export class ResyncDaemon {
     this.stopping = true;
     if (this.server) await new Promise(resolve => this.server.close(resolve));
     await rm(this.paths.socket, { force: true });
+    await rm(this.paths.daemonLock, { force: true });
+  }
+
+  async acquireProcessLock() {
+    const path = this.paths.daemonLock || `${this.paths.socket}.lock`;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const handle = await open(path, "wx", 0o600);
+        await handle.writeFile(`${process.pid}\n`);
+        await handle.close();
+        this.paths.daemonLock = path;
+        return;
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        const pid = Number((await readFile(path, "utf8").catch(() => "")).trim());
+        if (!pid) {
+          await rm(path, { force: true });
+          continue;
+        }
+        try {
+          process.kill(pid, 0);
+          throw new Error(`RepoSync daemon is already running as PID ${pid}`);
+        } catch (probe) {
+          if (probe.code !== "ESRCH") throw probe;
+          await rm(path, { force: true });
+        }
+      }
+    }
+    throw new Error("could not acquire RepoSync daemon lock");
   }
 }
 

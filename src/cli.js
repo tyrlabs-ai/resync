@@ -10,6 +10,7 @@ import { clearIdentity, readIdentity, repositoryRoot, writeIdentity } from "./id
 import { DEFAULT_PROVIDER, discover, enrollWithToken, providerFetch } from "./provider.js";
 import { fetchCatalog, materializeProject } from "./remote.js";
 import { rpc } from "./rpc.js";
+import { daemonRpc } from "./daemon-client.js";
 import { loadCatalog, loadConfig, statePaths, writeJson } from "./state.js";
 import { recoverTransaction } from "./transaction.js";
 import { git, run } from "./process.js";
@@ -95,7 +96,10 @@ async function projectJoin(projectId, localPath, provider) {
   const identity = await writeIdentity(project.localPath, { service: auth.origin, projectId });
   Object.assign(project, { service: auth.origin, checkoutId: identity.checkoutId });
   await ensureProjectConfig(project.localPath);
-  return persistProject(project, remote.catalog_generation);
+  await persistProject(project, remote.catalog_generation);
+  await installAdapters(project.projectId);
+  await daemonRpc({ method: "reload" });
+  return project;
 }
 
 async function projectInit(args, fork = false) {
@@ -115,6 +119,8 @@ async function projectInit(args, fork = false) {
   Object.assign(project, { service: auth.origin, checkoutId: identity.checkoutId });
   await ensureProjectConfig(root);
   await persistProject(project);
+  await installAdapters(project.projectId);
+  await daemonRpc({ method: "reload" });
   return { ...project, operation: fork ? "forked" : "initialized", previousProjectId: prior.projectId || null };
 }
 
@@ -192,7 +198,7 @@ async function codexHook(projectId) {
   const leasePath = join(directory, `${safeHookPart(input.tool_use_id)}.json`);
   if (input.hook_event_name === "PreToolUse") {
     try {
-      const result = await rpc({
+      const result = await daemonRpc({
         method: "acquireAccess", project_id: projectId, session_id: input.session_id,
         call_id: input.tool_use_id, access_hint: "unknown"
       });
@@ -224,7 +230,7 @@ async function codexHook(projectId) {
   if (input.hook_event_name === "PostToolUse") {
     try {
       const lease = JSON.parse(await readFile(leasePath, "utf8"));
-      await rpc({ method: "releaseAccess", lease_id: lease.leaseId, outcome: "success", mutation_hint: "possible" });
+      await daemonRpc({ method: "releaseAccess", lease_id: lease.leaseId, outcome: "success", mutation_hint: "possible" });
       await rm(leasePath, { force: true });
       return {};
     } catch (error) {
@@ -234,7 +240,7 @@ async function codexHook(projectId) {
   return {};
 }
 
-async function installAdapters(projectId) {
+export async function installAdapters(projectId, cliScript = resolve(process.argv[1])) {
   const catalog = await loadCatalog();
   const project = catalog.projects.find(item => item.projectId === projectId);
   if (!project) throw new Error(`project ${projectId} is not subscribed`);
@@ -266,7 +272,8 @@ async function installAdapters(projectId) {
     const existing = await readFile(hookPath, "utf8");
     if (!existing.includes("# RepoSync dispatcher")) await rename(hookPath, previous);
   } catch (error) { if (error.code !== "ENOENT") throw error; }
-  const script = `#!/bin/sh\n# RepoSync dispatcher\nset -u\n[ ! -x \"$0.pre-resync\" ] || \"$0.pre-resync\" \"$@\"\ncommit=\"$(git rev-parse HEAD 2>/dev/null)\" || exit 0\nbranch=\"$(git symbolic-ref --short HEAD 2>/dev/null)\" || exit 0\nresync report-commit ${shellQuote(projectId)} \"$commit\" \"$branch\" >/dev/null 2>&1 || true\n`;
+  const hookCli = `${shellQuote(process.execPath)} ${shellQuote(cliScript)}`;
+  const script = `#!/bin/sh\n# RepoSync dispatcher\nset -u\n[ ! -x \"$0.pre-resync\" ] || \"$0.pre-resync\" \"$@\"\ncommit=\"$(git rev-parse HEAD 2>/dev/null)\" || exit 0\nbranch=\"$(git symbolic-ref --short HEAD 2>/dev/null)\" || exit 0\n${hookCli} report-commit ${shellQuote(projectId)} \"$commit\" \"$branch\" >/dev/null || echo \"RepoSync could not schedule automatic publication\" >&2\n`;
   await writeFile(hookPath, script, { mode: 0o755 });
   await chmod(hookPath, 0o755);
   return { projectId, codexHooks: hooksPath, gitHook: hookPath, requiresCodexTrustReview: true };
@@ -291,9 +298,9 @@ async function dispatch(group, command, args) {
       const parsed = parseOptions(args, { "--path": "string", "--provider": "string" });
       result = await projectJoin(parsed.positional[0], parsed.options.path, parsed.options.provider);
     } else if (command === "leave") result = await unsubscribe(parseOptions(args).positional[0] || (await readIdentity()).projectId);
-    else if (command === "status") result = await rpc({ method: "status", project_id: parseOptions(args).positional[0] });
-    else if (command === "sync") result = await rpc({ method: "sync", project_id: parseOptions(args).positional[0] || (await readIdentity()).projectId });
-    else if (command === "publish") result = await rpc({ method: "publish", project_id: parseOptions(args).positional[0] || (await readIdentity()).projectId });
+    else if (command === "status") result = await daemonRpc({ method: "status", project_id: parseOptions(args).positional[0] });
+    else if (command === "sync") result = await daemonRpc({ method: "sync", project_id: parseOptions(args).positional[0] || (await readIdentity()).projectId });
+    else if (command === "publish") result = await daemonRpc({ method: "publish", project_id: parseOptions(args).positional[0] || (await readIdentity()).projectId });
     else if (command === "conflicts") result = await conflicts(parseOptions(args).positional[0]);
     else if (command === "recover") result = await recover();
   } else if (group === "device") {
@@ -359,9 +366,9 @@ export async function main(input) {
       const parsed = parseOptions(rest, { "--provider": "string" });
       return deviceList(parsed.options.provider);
     },
-    status: async rest => rpc({ method: "status", project_id: rest[0] }),
-    sync: async rest => rpc({ method: "sync", project_id: rest[0] || (await readIdentity()).projectId }),
-    publish: async rest => rpc({ method: "publish", project_id: rest[0] || (await readIdentity()).projectId }),
+    status: async rest => daemonRpc({ method: "status", project_id: rest[0] }),
+    sync: async rest => daemonRpc({ method: "sync", project_id: rest[0] || (await readIdentity()).projectId }),
+    publish: async rest => daemonRpc({ method: "publish", project_id: rest[0] || (await readIdentity()).projectId }),
     conflicts: async rest => conflicts(rest[0]),
     recover: async () => recover()
   };
@@ -378,10 +385,10 @@ export async function main(input) {
   if (root === "daemon") { await runDaemon(); return; }
   else if (root === "doctor") result = await doctor();
   else if (root === "install-adapters") result = await installAdapters(args[1]);
-  else if (root === "acquire") result = await rpc({ method: "acquireAccess", project_id: args[1], session_id: args[2] || randomUUID(), call_id: args[3] || randomUUID(), access_hint: "unknown" });
-  else if (root === "release") result = await rpc({ method: "releaseAccess", lease_id: args[1], outcome: "success", mutation_hint: "possible" });
+  else if (root === "acquire") result = await daemonRpc({ method: "acquireAccess", project_id: args[1], session_id: args[2] || randomUUID(), call_id: args[3] || randomUUID(), access_hint: "unknown" });
+  else if (root === "release") result = await daemonRpc({ method: "releaseAccess", lease_id: args[1], outcome: "success", mutation_hint: "possible" });
   else if (root === "codex-hook") result = await codexHook(args[1]);
-  else if (root === "report-commit") result = await rpc({
+  else if (root === "report-commit") result = await daemonRpc({
     method: "reportCommit", project_id: args[1], commit_oid: args[2], branch: args[3]
   });
   else {

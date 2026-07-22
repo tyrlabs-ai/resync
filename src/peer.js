@@ -11,7 +11,7 @@ import { ensureProjectConfig } from "./config.js";
 import { currentBranch } from "./git-state.js";
 import { loadCatalog, loadConfig, writeJson, statePaths } from "./state.js";
 import { git, run } from "./process.js";
-import { rpc } from "./rpc.js";
+import { daemonRpc } from "./daemon-client.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -65,7 +65,7 @@ export async function peerSync(args) {
   const localHead = (await git(identity.root, ["rev-parse", "HEAD"])).stdout.trim();
   const advertisedHead = () => project.advertised_heads.find(head => head.name === branch)?.oid || null;
   if (advertisedHead() !== localHead) {
-    try { await rpc({ method: "publish", project_id: identity.projectId }); }
+    try { await daemonRpc({ method: "publish", project_id: identity.projectId }); }
     catch (error) { throw new Error(`committed work is not published; start the daemon and run \`resync project publish\` before peer sync (${error.message})`); }
     catalog = await fetchCatalog({ server: identity.service, token });
     project = catalog.projects.find(item => item.project_id === identity.projectId);
@@ -136,5 +136,8 @@ export async function peerAccept(args) {
   Object.assign(localProject, { service: discovery.origin, checkoutId: identity.checkoutId });
   await ensureProjectConfig(localProject.localPath);
   await persistProject(localProject, catalog.catalog_generation);
+  const { installAdapters } = await import("./cli.js");
+  await installAdapters(localProject.projectId);
+  await daemonRpc({ method: "reload" });
   return { projectId: project, service: discovery.origin, checkoutId: identity.checkoutId, localPath: localProject.localPath };
 }

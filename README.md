@@ -17,9 +17,10 @@ npm install -g .
 resync auth login https://your-resync-host.example --token-command 'pass show resync/bootstrap'
 cd /absolute/path/to/checkout
 resync project init --name my-project
-resync daemon
-resync install-adapters PROJECT_ID
 ```
+
+Initialization installs the Git/Codex adapters and starts the per-user daemon
+automatically. The same is true for `join`, `fork`, and SSH peer enrollment.
 
 Every command level supports both help spellings and lists its direct commands and options:
 
@@ -48,9 +49,9 @@ lease_json="$(resync acquire PROJECT_ID SESSION_ID CALL_ID)"
 resync release LEASE_ID
 ```
 
-Use `resync sync PROJECT_ID` for an explicit compatibility-mode barrier and `resync publish PROJECT_ID` after a logical commit. The daemon's Unix socket is mode `0600`; its state defaults to `~/.local/state/resync` and can be redirected with `RESYNC_STATE_DIR`.
+Ordinary `git commit` is the publication trigger; no RepoSync command is needed afterward. Use `resync sync PROJECT_ID` for an explicit compatibility-mode barrier and `resync publish PROJECT_ID` only to retry or flush publication manually. The daemon's Unix socket is mode `0600`; its state defaults to `~/.local/state/resync` and can be redirected with `RESYNC_STATE_DIR`.
 
-`install-adapters` merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json` and installs a chainable, signal-only Git `post-commit` hook. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. The pre-tool hook denies a local tool call if the access barrier cannot be reached, while the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
+Enrollment automatically merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json` and installs a chainable, signal-only Git `post-commit` hook. `install-adapters` remains available as a repair command. A hook starts the daemon if necessary, so a commit notification is not lost merely because no daemon process was already running. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. The pre-tool hook denies a local tool call if the access barrier cannot be reached, while the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
 
 ## Correctness boundary
 

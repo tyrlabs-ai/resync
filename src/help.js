@@ -28,7 +28,7 @@ export const commandTree = {
         fork: { description: "Create an independent project ID from the current Git repository.", usage: "resync project fork [options]", options: [["--name <name>", "Name for the independent hosted project"], ["--provider <url>", "Provider for the new project"]] },
         status: { description: "Show freshness, durability, project ID, and checkout ID.", usage: "resync project status [project]" },
         sync: { description: "Fetch and reconcile at an explicit barrier.", usage: "resync project sync [project]" },
-        publish: { description: "Validate and publish logical commits without force.", usage: "resync project publish [project]" },
+        publish: { description: "Explicitly flush publication (commits publish automatically).", usage: "resync project publish [project]" },
         conflicts: { description: "List blocked reconciliation records.", usage: "resync project conflicts [project]" },
         recover: { description: "Recover interrupted reconciliation transactions.", usage: "resync project recover [project]" },
         leave: { description: "Stop managing a checkout without deleting its files.", usage: "resync project leave [project-id]" }
@@ -48,9 +48,9 @@ export const commandTree = {
         accept: { description: "Internal remote-side ticket redemption helper.", usage: "resync peer accept [options]", options: [["--provider <url>", "Ticket issuer"], ["--ticket <ticket>", "Single-use enrollment capability"], ["--project <id>", "Expected project ID"], ["--into <path>", "Destination checkout path"], ["--device-name <name>", "Remote device name"]] }
       }
     },
-    daemon: { description: "Run the per-user synchronization daemon.", usage: "resync daemon", options: [["--poll-interval <duration>", "Catalog polling interval (default 10s)"]] },
+    daemon: { description: "Run the per-user synchronization daemon (normally started automatically).", usage: "resync daemon", options: [["--poll-interval <duration>", "Catalog polling interval (default 10s)"]] },
     doctor: { description: "Check Git, Node, provider, daemon, identity, and credential state.", usage: "resync doctor" },
-    "install-adapters": { description: "Install chainable Codex and Git lifecycle adapters.", usage: "resync install-adapters <project-id>" },
+    "install-adapters": { description: "Repair or reinstall automatically managed lifecycle adapters.", usage: "resync install-adapters <project-id>" },
     acquire: { description: "Acquire one cooperative tool-call lease (adapter API).", usage: "resync acquire <project-id> [session-id] [call-id]" },
     release: { description: "Release one cooperative tool-call lease (adapter API).", usage: "resync release <lease-id>" }
   }

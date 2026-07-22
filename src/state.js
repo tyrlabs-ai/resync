@@ -15,6 +15,7 @@ export function statePaths() {
     keys: join(root, "keys"),
     catalog: join(root, "catalog.json"),
     transactions: join(root, "transactions"),
+    daemonLock: join(root, "daemon.lock"),
     socket: process.env.RESYNC_SOCKET || join(root, "daemon.sock")
   };
 }
