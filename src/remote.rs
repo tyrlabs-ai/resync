@@ -198,6 +198,136 @@ fn configure_remote(destination: &Path, remote_name: &str, remote_url: &str) -> 
     Ok(())
 }
 
+fn adopt_exact_snapshot(
+    destination: &Path,
+    catalog_project: &CatalogProject,
+    token: Option<&str>,
+    remote_name: &str,
+) -> Result<()> {
+    let metadata = destination.join(".git");
+    if metadata.exists() {
+        bail!(
+            "{} contains Git metadata but is not a valid worktree",
+            destination.display()
+        );
+    }
+    git(
+        destination,
+        [
+            "init",
+            &format!("--initial-branch={}", catalog_project.default_branch),
+        ],
+        RunOptions::default(),
+    )?;
+    let result = (|| -> Result<()> {
+        configure_remote(destination, remote_name, &catalog_project.remote_url)?;
+        let refspec = format!("+refs/heads/*:refs/remotes/{remote_name}/*");
+        git(
+            destination,
+            ["fetch", "--prune", "--no-tags", remote_name, &refspec],
+            RunOptions {
+                env: authorization_env(token),
+                ..RunOptions::default()
+            },
+        )?;
+        let revisions = git(
+            destination,
+            ["rev-list", "--topo-order", "--all"],
+            RunOptions::default(),
+        )?;
+        let baseline = revisions
+            .stdout
+            .lines()
+            .find(|oid| {
+                if !git(
+                    destination,
+                    ["read-tree", oid],
+                    RunOptions {
+                        allow_failure: true,
+                        ..RunOptions::default()
+                    },
+                )
+                .is_ok_and(|result| result.code == 0)
+                {
+                    return false;
+                }
+                git(
+                    destination,
+                    ["diff", "--quiet", "--", "."],
+                    RunOptions {
+                        allow_failure: true,
+                        ..RunOptions::default()
+                    },
+                )
+                .is_ok_and(|result| result.code == 0)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} does not exactly match the tracked files of any hosted commit; refusing to adopt it",
+                    destination.display()
+                )
+            })?;
+        let default_head = catalog_project
+            .advertised_heads
+            .iter()
+            .find(|head| head.name == catalog_project.default_branch);
+        let mut branch = match default_head {
+            Some(head) if is_ancestor(destination, baseline, &head.oid)? => {
+                Some(head.name.as_str())
+            }
+            _ => None,
+        };
+        if branch.is_none() {
+            for head in &catalog_project.advertised_heads {
+                if is_ancestor(destination, baseline, &head.oid)? {
+                    branch = Some(head.name.as_str());
+                    break;
+                }
+            }
+        }
+        let branch = branch.ok_or_else(|| {
+            anyhow::anyhow!(
+                "matching commit {baseline} is not reachable from an advertised hosted branch"
+            )
+        })?;
+        let reference = format!("refs/heads/{branch}");
+        git(
+            destination,
+            ["symbolic-ref", "HEAD", &reference],
+            RunOptions::default(),
+        )?;
+        git(
+            destination,
+            ["update-ref", &reference, baseline],
+            RunOptions::default(),
+        )?;
+        git(
+            destination,
+            ["reset", "--mixed", baseline],
+            RunOptions::default(),
+        )?;
+        git(
+            destination,
+            ["config", &format!("branch.{branch}.remote"), remote_name],
+            RunOptions::default(),
+        )?;
+        git(
+            destination,
+            [
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+            RunOptions::default(),
+        )?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(metadata);
+    }
+    result
+}
+
 pub fn materialize_project(
     catalog_project: &CatalogProject,
     local_path: &Path,
@@ -284,7 +414,10 @@ pub fn materialize_project(
         .code
             != 0
         {
-            bail!("{} exists but is not a Git worktree", destination.display());
+            if advertised.is_empty() {
+                bail!("{} exists but is not a Git worktree", destination.display());
+            }
+            adopt_exact_snapshot(&destination, catalog_project, token, remote_name)?;
         }
     }
     configure_remote(&destination, remote_name, &catalog_project.remote_url)?;

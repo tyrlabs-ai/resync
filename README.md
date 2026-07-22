@@ -46,6 +46,10 @@ The initiating machine creates a five-minute, one-time join ticket and bootstrap
 Managed SSH environments can export `RESYNC_PEER_PROJECT_PATH` to make a bare
 `resync <ssh-target>` enroll their active project checkout. RepoSync also
 recognizes the equivalent `YOLOPODS_PROJECT_PATH` value exported by Yolopods.
+If that path is a source snapshot without Git metadata, RepoSync adopts it only
+when all tracked files exactly match a commit in the hosted history. Untracked
+files are preserved; a modified or unknown snapshot is refused without leaving
+partial Git metadata behind.
 
 In another terminal (or an agent adapter), bracket every participating tool call:
 
