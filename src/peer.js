@@ -39,10 +39,12 @@ async function persistProject(project, generation) {
   await writeJson(statePaths().catalog, catalog);
 }
 
-function ticketEndpoint(discovery, projectId) {
+export function ticketEndpoint(discovery, projectId) {
   const template = discovery.endpoints.join_tickets;
   if (!template) return new URL(`/v1/projects/${encodeURIComponent(projectId)}/join-tickets`, discovery.origin);
-  return template.replace("{project_id}", encodeURIComponent(projectId));
+  return template
+    .replace("{project_id}", encodeURIComponent(projectId))
+    .replace(/%7Bproject_id%7D/i, encodeURIComponent(projectId));
 }
 
 export async function peerSync(args) {
@@ -71,7 +73,7 @@ export async function peerSync(args) {
   const remoteRoot = ".local/share/resync/bootstrap/0.2.0";
   if (!parsed.options.no_bootstrap) {
     await run("rsync", [
-      "--archive", "--exclude=.git", "--exclude=node_modules", "--exclude=test", "-e", "ssh",
+      "--archive", "--mkpath", "--exclude=.git", "--exclude=node_modules", "--exclude=test", "-e", "ssh",
       `${packageRoot}/`, `${target.host}:${remoteRoot}/`
     ]);
   }
