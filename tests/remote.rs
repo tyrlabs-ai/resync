@@ -118,3 +118,47 @@ fn materialization_refuses_a_modified_non_git_directory() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+#[test]
+fn materialization_does_not_mistake_an_old_partial_tree_for_a_snapshot() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    fs::write(fixture.seed.join("added-later"), "hosted\n")?;
+    git(&fixture.seed, ["add", "."], RunOptions::default())?;
+    git(
+        &fixture.seed,
+        ["commit", "-m", "add another tracked file"],
+        RunOptions::default(),
+    )?;
+    git(
+        &fixture.seed,
+        ["push", "origin", "main"],
+        RunOptions::default(),
+    )?;
+    let remote_head = rev(&fixture.seed, "HEAD")?;
+    let destination = fixture.root.path().join("partial-tree");
+    fs::create_dir(&destination)?;
+    fs::write(destination.join("file"), "base\n")?;
+    fs::write(destination.join("added-later"), "different\n")?;
+    let project = CatalogProject {
+        project_id: "prj_partial_tree".into(),
+        name: "partial-tree".into(),
+        remote_url: fixture.remote.to_string_lossy().into_owned(),
+        default_branch: "main".into(),
+        advertised_heads: vec![AdvertisedHead {
+            name: "main".into(),
+            oid: remote_head,
+        }],
+        project_generation: 2,
+        extra: Map::new(),
+    };
+
+    let error = materialize_project(&project, &destination, None, "resync").unwrap_err();
+
+    assert!(error.to_string().contains("refusing to adopt"));
+    assert!(!destination.join(".git").exists());
+    assert_eq!(
+        fs::read_to_string(destination.join("added-later"))?,
+        "different\n"
+    );
+    Ok(())
+}

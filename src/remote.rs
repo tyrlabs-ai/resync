@@ -235,33 +235,56 @@ fn adopt_exact_snapshot(
             ["rev-list", "--topo-order", "--all"],
             RunOptions::default(),
         )?;
-        let baseline = revisions
+        let history = git(
+            destination,
+            ["log", "--all", "--format=", "--name-only", "-z"],
+            RunOptions::default(),
+        )?;
+        let history_paths: BTreeSet<&str> = history
             .stdout
-            .lines()
-            .find(|oid| {
-                if !git(
-                    destination,
-                    ["read-tree", oid],
-                    RunOptions {
-                        allow_failure: true,
-                        ..RunOptions::default()
-                    },
-                )
-                .is_ok_and(|result| result.code == 0)
-                {
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .collect();
+        let mut baseline = None;
+        for oid in revisions.stdout.lines() {
+            git(destination, ["read-tree", oid], RunOptions::default())?;
+            let difference = git(
+                destination,
+                ["diff", "--quiet", "--", "."],
+                RunOptions {
+                    allow_failure: true,
+                    ..RunOptions::default()
+                },
+            )?;
+            if difference.code != 0 {
+                continue;
+            }
+            let tree = git(
+                destination,
+                ["ls-tree", "-r", "--name-only", "-z", oid],
+                RunOptions::default(),
+            )?;
+            let tree_paths: BTreeSet<&str> = tree
+                .stdout
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .collect();
+            let has_historical_extras = history_paths.iter().any(|path| {
+                if tree_paths.contains(path) {
                     return false;
                 }
-                git(
-                    destination,
-                    ["diff", "--quiet", "--", "."],
-                    RunOptions {
-                        allow_failure: true,
-                        ..RunOptions::default()
-                    },
-                )
-                .is_ok_and(|result| result.code == 0)
-            })
-            .ok_or_else(|| {
+                match fs::symlink_metadata(destination.join(path)) {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(_) => true,
+                }
+            });
+            if !has_historical_extras {
+                baseline = Some(oid.to_owned());
+                break;
+            }
+        }
+        let baseline = baseline.ok_or_else(|| {
                 anyhow::anyhow!(
                     "{} does not exactly match the tracked files of any hosted commit; refusing to adopt it",
                     destination.display()
@@ -272,14 +295,14 @@ fn adopt_exact_snapshot(
             .iter()
             .find(|head| head.name == catalog_project.default_branch);
         let mut branch = match default_head {
-            Some(head) if is_ancestor(destination, baseline, &head.oid)? => {
+            Some(head) if is_ancestor(destination, &baseline, &head.oid)? => {
                 Some(head.name.as_str())
             }
             _ => None,
         };
         if branch.is_none() {
             for head in &catalog_project.advertised_heads {
-                if is_ancestor(destination, baseline, &head.oid)? {
+                if is_ancestor(destination, &baseline, &head.oid)? {
                     branch = Some(head.name.as_str());
                     break;
                 }
@@ -298,12 +321,12 @@ fn adopt_exact_snapshot(
         )?;
         git(
             destination,
-            ["update-ref", &reference, baseline],
+            ["update-ref", &reference, &baseline],
             RunOptions::default(),
         )?;
         git(
             destination,
-            ["reset", "--mixed", baseline],
+            ["reset", "--mixed", &baseline],
             RunOptions::default(),
         )?;
         git(
