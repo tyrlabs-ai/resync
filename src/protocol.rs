@@ -14,6 +14,7 @@ pub const WORKSPACE_STATES: &[&str] = &[
     "RECONCILING",
     "CONFLICTED",
     "OFFLINE",
+    "ACCESS_LOST",
     "FAILED",
 ];
 

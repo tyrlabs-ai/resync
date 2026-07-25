@@ -7,6 +7,9 @@ use resync::remote::fetch_remote;
 use resync::state::{Config, Conflict, LocalCatalog, LocalProject, StatePaths};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
 use std::time::Duration;
 
 #[test]
@@ -169,4 +172,92 @@ fn current_reconciliation_clears_stale_conflict() -> anyhow::Result<()> {
         assert_eq!(snapshot.conflict, None);
         anyhow::Ok(())
     })
+}
+
+#[test]
+fn missing_provider_membership_becomes_access_lost() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let address = listener.local_addr()?;
+    let server = thread::spawn(move || -> anyhow::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = [0_u8; 8192];
+        let _ = stream.read(&mut request)?;
+        let body = serde_json::to_string(&serde_json::json!({
+            "protocol": "resync.v1",
+            "projects": [{
+                "project_id": "prj_access_lost",
+                "checkout_id": "chk_access_lost",
+                "active_branch": "main",
+                "membership": "ACCESS_LOST"
+            }]
+        }))?;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )?;
+        Ok(())
+    });
+    let project = LocalProject {
+        project_id: "prj_access_lost".into(),
+        local_path: fixture.local.clone(),
+        remote_url: fixture.remote.to_string_lossy().into_owned(),
+        remote_name: "origin".into(),
+        default_branch: "main".into(),
+        server_generation: 1,
+        advertised_heads: BTreeMap::from([("main".into(), fixture.base.clone())]),
+        last_applied_heads: BTreeMap::from([("main".into(), fixture.base)]),
+        active_branch: Some("main".into()),
+        workspace_generation: 1,
+        state: "CURRENT".into(),
+        durability: "REMOTELY_DURABLE".into(),
+        conflict: None,
+        last_error: None,
+        service: Some(format!("http://{address}")),
+        checkout_id: Some("chk_access_lost".into()),
+        extra: BTreeMap::new(),
+    };
+    let root = fixture.root.path().join("state");
+    let paths = StatePaths {
+        config: root.join("config.json"),
+        credentials: root.join("credentials.json"),
+        keys: root.join("keys"),
+        catalog: root.join("catalog.json"),
+        transactions: root.join("transactions"),
+        daemon_lock: root.join("daemon.lock"),
+        socket: root.join("daemon.sock"),
+        root,
+    };
+    let daemon = ResyncDaemon::from_parts(
+        paths,
+        Config {
+            server: Some(format!("http://{address}")),
+            token: Some("test-token".into()),
+            ..Config::default()
+        },
+        LocalCatalog {
+            catalog_generation: 1,
+            projects: vec![project],
+        },
+        Duration::from_secs(10),
+        Duration::from_secs(60),
+    )?;
+    let runtime = resync::daemon::runtime()?;
+    runtime.block_on(async {
+        daemon.refresh().await?;
+        let snapshot = daemon.project_snapshot("prj_access_lost").await?;
+        assert_eq!(snapshot.state, "ACCESS_LOST");
+        assert!(
+            snapshot
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("no longer authorizes")
+        );
+        anyhow::Ok(())
+    })?;
+    server.join().unwrap()?;
+    Ok(())
 }

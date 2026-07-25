@@ -14,13 +14,20 @@ Unauthenticated provider discovery document:
 {
   "protocol": "resync.v1",
   "service_id": "svc_example",
+  "capabilities": [
+    "membership-extension-v1",
+    "durable-publication-v1",
+    "active-branch-heartbeat-v1"
+  ],
   "auth_methods": ["bootstrap-token", "join-ticket"],
   "endpoints": {
     "enroll": "/v1/auth/enroll",
     "catalog": "/v1/catalog",
     "projects": "/v1/projects",
     "join_tickets": "/v1/projects/{project_id}/join-tickets",
-    "redeem_join_ticket": "/v1/join-tickets/redeem"
+    "redeem_join_ticket": "/v1/join-tickets/redeem",
+    "heartbeat": "/v1/heartbeat",
+    "publications": "/v1/projects/{project_id}/publications"
   }
 }
 ```
@@ -59,7 +66,11 @@ The catalog is compact discovery metadata. `advertised_heads` contains every bra
 
 ### `POST /v1/projects`
 
-Creates a new synchronization universe for the authenticated account and automatically authorizes the calling device. An existing Git history may seed multiple project IDs intentionally.
+Creates a new synchronization universe for the authenticated account and
+automatically authorizes the calling device. An existing Git history may seed
+multiple project IDs intentionally. The request SHOULD contain a persisted
+`idempotency_key`; repeating the same key for the same account returns the
+original project instead of creating a duplicate after a partial client crash.
 
 ### `POST /v1/projects/{project_id}/join-tickets`
 
@@ -67,7 +78,48 @@ Creates a random, single-use, short-lived capability scoped to exactly one servi
 
 ### `POST /v1/join-tickets/redeem`
 
-The new machine submits the ticket, its newly generated public key, and a device name. The service atomically consumes the ticket, enrolls the device only into the ticket's project, and returns that device's own credential. Reuse, expiration, project substitution, and service-origin substitution are errors.
+The new machine submits the ticket, its newly generated public key, and a device
+name. The service atomically consumes the ticket, enrolls the device only into
+the ticket's project, and returns that device's own credential. When
+authenticated by an existing device, redemption MUST extend that device's
+monotonically growing project membership without replacing its ID, credential,
+key, or previous memberships. A client MUST fail closed unless provider
+discovery advertises `membership-extension-v1`. Reuse, expiration, project
+substitution, and service-origin substitution are errors.
+
+### `POST /v1/heartbeat`
+
+The client submits one record per managed checkout containing `project_id`,
+`checkout_id`, and `active_branch`. The response contains only membership, the
+authoritative head for that exact active branch, and project generation. A
+missing membership is returned as `ACCESS_LOST`. The payload and server work
+MUST NOT grow with unrelated branch count.
+
+### `POST /v1/projects/{project_id}/publications`
+
+After object transfer and the protected ref update, the client submits an
+immutable `(publication_id, attempt)` payload with `branch`, `candidate_oid`,
+and `expected_remote_oid`. If the candidate is durably reachable from the
+hosted branch, the provider persists and returns a replayable ACK:
+
+```json
+{
+  "publication_id": "pub_example",
+  "attempt": 1,
+  "project_id": "prj_example",
+  "branch": "main",
+  "accepted_oid": "0123456789abcdef0123456789abcdef01234567",
+  "remote_head": "0123456789abcdef0123456789abcdef01234567",
+  "project_generation": 42,
+  "durable": true
+}
+```
+
+Duplicate immutable attempts return the stored ACK. Reusing an attempt ID with
+different content is a protocol error. An incompatible hosted advance returns
+HTTP `409` with `outcome: REMOTE_ADVANCED`; it is not an ACK. If the ref update
+committed but ACK persistence did not, a retry reconstructs the ACK from branch
+reachability.
 
 ### Git smart HTTP
 
@@ -87,11 +139,22 @@ The daemon listens on a mode-`0600` Unix socket and exchanges newline-delimited 
 
 A grant contains `lease_id`, `workspace_generation`, `branch_oid`, `reconciliation`, an optional path summary, and an optional model-visible message. A blocked response contains `state`, `model_message`, and `recovery_actions`.
 
-Release uses `releaseAccess` with the lease ID and outcome. Other V1 methods are `status`, `sync`, `publish`, and `ping`. A successful `ping` reports the daemon PID and a SHA-256 `binaryId` for the running executable. A client whose own executable fingerprint differs MUST replace the stale per-user daemon before sending an operation that depends on current reconciliation behavior. IPC access is local authorization; repository canonicalization and subscription checks scope every request.
+Release uses `releaseAccess` with the lease ID and outcome. Other V1 methods are
+`status`, `sync`, `publish`, `reportCommit`, `reportCheckout`, and `ping`. A
+successful `ping` reports the daemon PID and a SHA-256 `binaryId` for the
+running executable. A client whose own executable fingerprint differs MUST
+replace the stale per-user daemon before sending an operation that depends on
+current reconciliation behavior. IPC access is local authorization; repository
+canonicalization and subscription checks scope every request.
 
 ## Credential storage contract
 
-Non-secret provider configuration belongs under the user's configuration directory. Device private keys and bearer credentials belong in an interchangeable credential store keyed by canonical service origin and device ID.
+Non-secret provider configuration belongs under the user's configuration
+directory. Device private keys and bearer credentials belong in an
+interchangeable credential store keyed by canonical service origin and device
+ID. Joining a project extends the project membership of that same
+provider/device identity; it never rotates the active provider credential as a
+side effect.
 
 Implementations SHOULD prefer an operating-system keychain or configured external credential helper. A headless fallback MAY use files readable only by the operating-system user, but MUST describe that boundary honestly and MUST NOT claim that a key stored beside encrypted data adds protection. Environment credentials MAY be used without persistence in CI.
 

@@ -7,11 +7,24 @@ use crate::transaction::reconcile_workspace;
 use anyhow::{Result, bail};
 use base64::Engine;
 use reqwest::blocking::Client;
+use serde::Deserialize;
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use url::Url;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HeartbeatProject {
+    pub project_id: String,
+    pub active_branch: String,
+    pub membership: String,
+    #[serde(default)]
+    pub head: Option<String>,
+    #[serde(default)]
+    pub project_generation: u64,
+}
 
 pub fn authorization_env(token: Option<&str>) -> BTreeMap<OsString, OsString> {
     let Some(token) = token else {
@@ -69,6 +82,55 @@ pub fn fetch_catalog(config: &Config) -> Result<Catalog> {
         );
     }
     Catalog::from_value(serde_json::from_str(&text)?)
+}
+
+pub fn heartbeat(config: &Config, projects: &[LocalProject]) -> Result<Vec<HeartbeatProject>> {
+    let server = config
+        .server
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("provider is not configured"))?;
+    let token = config
+        .token
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("provider credential is unavailable"))?;
+    let url = Url::parse(server)?.join("/v1/heartbeat")?;
+    let checkouts = projects
+        .iter()
+        .map(|project| {
+            let active_branch = current_branch(&project.local_path)
+                .ok()
+                .or_else(|| project.active_branch.clone())
+                .unwrap_or_else(|| project.default_branch.clone());
+            json!({
+                "project_id": project.project_id,
+                "checkout_id": project.checkout_id,
+                "active_branch": active_branch
+            })
+        })
+        .collect::<Vec<_>>();
+    let response = Client::new()
+        .post(url)
+        .bearer_auth(token)
+        .header("accept", "application/json")
+        .json(&json!({ "checkouts": checkouts }))
+        .send()?;
+    let status = response.status();
+    let value: serde_json::Value = response.json()?;
+    if !status.is_success() {
+        bail!(
+            "{}",
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("provider heartbeat failed")
+        );
+    }
+    Ok(serde_json::from_value(
+        value
+            .get("projects")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("provider heartbeat omitted projects"))?,
+    )?)
 }
 
 fn refs(project_path: &Path, prefix: &str) -> Result<BTreeMap<String, String>> {
@@ -165,6 +227,54 @@ pub fn fetch_remote(
         );
     }
     remote_heads(&project.local_path, &project.remote_name)
+}
+
+pub fn fetch_remote_branch(
+    project: &LocalProject,
+    branch: &str,
+    token: Option<&str>,
+) -> Result<Option<String>> {
+    let remote_ref = format!("refs/heads/{branch}");
+    let tracking_ref = format!("refs/remotes/{}/{branch}", project.remote_name);
+    let result = git(
+        &project.local_path,
+        [
+            "fetch",
+            "--no-tags",
+            &project.remote_name,
+            &format!("+{remote_ref}:{tracking_ref}"),
+        ],
+        RunOptions {
+            env: authorization_env(token),
+            allow_failure: true,
+            ..RunOptions::default()
+        },
+    )?;
+    if result.code != 0 {
+        if result.stderr.contains("couldn't find remote ref") {
+            let _ = git(
+                &project.local_path,
+                ["update-ref", "-d", &tracking_ref],
+                RunOptions {
+                    allow_failure: true,
+                    ..RunOptions::default()
+                },
+            );
+            return Ok(None);
+        }
+        bail!("{}", result.stderr.trim());
+    }
+    let resolved = git(
+        &project.local_path,
+        ["rev-parse", "--verify", &tracking_ref],
+        RunOptions {
+            allow_failure: true,
+            ..RunOptions::default()
+        },
+    )?;
+    Ok((resolved.code == 0)
+        .then(|| resolved.stdout.trim().to_owned())
+        .filter(|value| !value.is_empty()))
 }
 
 fn configure_remote(destination: &Path, remote_name: &str, remote_url: &str) -> Result<()> {

@@ -88,6 +88,9 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<()>
     #[cfg(unix)]
     fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
     fs::rename(&temporary, path)?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 

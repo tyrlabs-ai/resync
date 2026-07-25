@@ -2,7 +2,11 @@ use crate::config::read_project_config;
 use crate::git_state::{capture_workspace, current_branch};
 use crate::process::{RunOptions, git, run};
 use crate::protocol::PROTOCOL_VERSION;
-use crate::remote::{authorization_env, fetch_catalog, fetch_remote, resolved_config};
+use crate::publication::{
+    ACKNOWLEDGED, ProviderPublication, Publication, PublicationAck, PublicationQueue,
+    acknowledge_with_provider,
+};
+use crate::remote::{authorization_env, fetch_remote_branch, heartbeat, resolved_config};
 use crate::state::{
     Config, LocalCatalog, LocalProject, StatePaths, load_catalog, read_json, state_paths,
     write_json,
@@ -113,6 +117,8 @@ struct DaemonInner {
     gates: StdMutex<HashMap<String, Arc<LeaseGate>>>,
     background_reconciliations: StdMutex<HashSet<String>>,
     lease_projects: Mutex<HashMap<String, String>>,
+    publications: Mutex<PublicationQueue>,
+    publication_processing: Mutex<()>,
     poll_interval: Duration,
     max_lease: Duration,
 }
@@ -131,6 +137,7 @@ impl ResyncDaemon {
         let paths = paths.unwrap_or_else(state_paths);
         let config = resolved_config()?;
         let mut catalog: LocalCatalog = read_json(&paths.catalog, LocalCatalog::default())?;
+        let publications = PublicationQueue::load(&paths)?;
         migrate_projects(&mut catalog.projects);
         write_json(&paths.catalog, &catalog, 0o600)?;
         Ok(Self {
@@ -142,6 +149,8 @@ impl ResyncDaemon {
                 gates: StdMutex::new(HashMap::new()),
                 background_reconciliations: StdMutex::new(HashSet::new()),
                 lease_projects: Mutex::new(HashMap::new()),
+                publications: Mutex::new(publications),
+                publication_processing: Mutex::new(()),
                 poll_interval,
                 max_lease,
             }),
@@ -156,6 +165,7 @@ impl ResyncDaemon {
         max_lease: Duration,
     ) -> Result<Self> {
         migrate_projects(&mut catalog.projects);
+        let publications = PublicationQueue::load(&paths)?;
         write_json(&paths.catalog, &catalog, 0o600)?;
         Ok(Self {
             inner: Arc::new(DaemonInner {
@@ -166,6 +176,8 @@ impl ResyncDaemon {
                 gates: StdMutex::new(HashMap::new()),
                 background_reconciliations: StdMutex::new(HashSet::new()),
                 lease_projects: Mutex::new(HashMap::new()),
+                publications: Mutex::new(publications),
+                publication_processing: Mutex::new(()),
                 poll_interval,
                 max_lease,
             }),
@@ -194,39 +206,92 @@ impl ResyncDaemon {
     }
 
     pub async fn refresh(&self) -> Result<()> {
-        let remote = fetch_catalog(&self.inner.config)?;
+        if self.inner.config.server.is_none() || self.inner.config.token.is_none() {
+            return Ok(());
+        }
+        let snapshots = self.inner.catalog.lock().await.projects.clone();
+        let config = self.inner.config.clone();
+        let remote = tokio::task::spawn_blocking(move || heartbeat(&config, &snapshots)).await??;
         let token = self.inner.config.token.as_deref();
         let mut catalog = self.inner.catalog.lock().await;
-        catalog.catalog_generation = remote.catalog_generation;
+        let mut pending_reconciliation = Vec::new();
+        let mut missing_publications = Vec::new();
         for project in &mut catalog.projects {
+            let actual_branch = current_branch(&project.local_path)
+                .ok()
+                .or_else(|| project.active_branch.clone())
+                .unwrap_or_else(|| project.default_branch.clone());
+            project.active_branch = Some(actual_branch.clone());
             let Some(update) = remote
-                .projects
                 .iter()
                 .find(|item| item.project_id == project.project_id)
             else {
+                project.state = "ACCESS_LOST".into();
+                project.last_error =
+                    Some("provider heartbeat omitted a locally subscribed project".into());
                 continue;
             };
-            project.remote_url = update.remote_url.clone();
-            project.default_branch = update.default_branch.clone();
+            if update.membership != "ACTIVE" {
+                project.state = "ACCESS_LOST".into();
+                project.last_error =
+                    Some("device credential no longer authorizes this subscribed project".into());
+                continue;
+            }
             project.server_generation = update.project_generation;
-            match fetch_remote(project, token) {
+            match fetch_remote_branch(project, &actual_branch, token) {
                 Ok(fetched) => {
-                    project.advertised_heads = fetched;
-                    project.active_branch = current_branch(&project.local_path).ok();
-                    let target = project
-                        .active_branch
-                        .as_ref()
-                        .and_then(|branch| project.advertised_heads.get(branch));
-                    let applied = project
-                        .active_branch
-                        .as_ref()
-                        .and_then(|branch| project.last_applied_heads.get(branch));
-                    if target.is_some() && target != applied && project.state != "CONFLICTED" {
-                        project.state = "REMOTE_AHEAD".into();
-                    } else if project.state != "CONFLICTED" {
-                        project.state = "CURRENT".into();
+                    match fetched.or_else(|| update.head.clone()) {
+                        Some(head) => {
+                            project.advertised_heads.insert(actual_branch.clone(), head);
+                        }
+                        None => {
+                            project.advertised_heads.remove(&actual_branch);
+                        }
                     }
-                    project.last_error = None;
+                    let local_head = git(
+                        &project.local_path,
+                        ["rev-parse", "HEAD"],
+                        RunOptions::default(),
+                    )?
+                    .stdout
+                    .trim()
+                    .to_owned();
+                    let target = project.advertised_heads.get(&actual_branch).cloned();
+                    if project.state != "CONFLICTED" {
+                        match target {
+                            None => {
+                                project.state = "CURRENT".into();
+                                missing_publications.push((
+                                    project.project_id.clone(),
+                                    actual_branch.clone(),
+                                    local_head,
+                                ));
+                            }
+                            Some(target) if target == local_head => {
+                                project.state = "CURRENT".into();
+                                project
+                                    .last_applied_heads
+                                    .insert(actual_branch.clone(), target);
+                            }
+                            Some(target)
+                                if is_ancestor(&project.local_path, &target, &local_head)? =>
+                            {
+                                project.state = "CURRENT".into();
+                                missing_publications.push((
+                                    project.project_id.clone(),
+                                    actual_branch.clone(),
+                                    local_head,
+                                ));
+                            }
+                            Some(_) => {
+                                project.state = "REMOTE_AHEAD".into();
+                                pending_reconciliation.push(project.project_id.clone());
+                            }
+                        }
+                    }
+                    if project.durability == "REMOTELY_DURABLE" {
+                        project.last_error = None;
+                    }
                 }
                 Err(error) => {
                     project.state = "OFFLINE".into();
@@ -234,15 +299,13 @@ impl ResyncDaemon {
                 }
             }
         }
-        let pending = catalog
-            .projects
-            .iter()
-            .filter(|project| project.state == "REMOTE_AHEAD")
-            .map(|project| project.project_id.clone())
-            .collect::<Vec<_>>();
         self.persist(&catalog).await?;
         drop(catalog);
-        for project_id in pending {
+        for (project_id, branch, head) in missing_publications {
+            self.enqueue_publication(&project_id, &branch, &head)
+                .await?;
+        }
+        for project_id in pending_reconciliation {
             self.schedule_reconcile(project_id);
         }
         Ok(())
@@ -365,12 +428,54 @@ impl ResyncDaemon {
         Ok(result)
     }
 
+    async fn ensure_branch_transition(&self, project_id: &str) -> Result<()> {
+        let project = {
+            let catalog = self.inner.catalog.lock().await;
+            find_project(&catalog, project_id)?.clone()
+        };
+        let actual = current_branch(&project.local_path)?;
+        let Some(previous) = project.active_branch else {
+            let mut catalog = self.inner.catalog.lock().await;
+            find_project_mut(&mut catalog, project_id)?.active_branch = Some(actual);
+            self.persist(&catalog).await?;
+            return Ok(());
+        };
+        if previous == actual {
+            return Ok(());
+        }
+        let outgoing = git(
+            &project.local_path,
+            ["rev-parse", "--verify", &format!("refs/heads/{previous}")],
+            RunOptions {
+                allow_failure: true,
+                ..RunOptions::default()
+            },
+        )?;
+        if outgoing.code == 0 {
+            self.enqueue_publication(project_id, &previous, outgoing.stdout.trim())
+                .await?;
+        }
+        {
+            let mut catalog = self.inner.catalog.lock().await;
+            find_project_mut(&mut catalog, project_id)?.active_branch = Some(actual);
+            self.persist(&catalog).await?;
+        }
+        if self.inner.config.server.is_some() && self.inner.config.token.is_some() {
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
     async fn acquire(&self, request: &Value) -> Result<Value> {
         let project_id = string_field(request, "project_id")?;
+        self.ensure_branch_transition(project_id).await?;
         {
             let catalog = self.inner.catalog.lock().await;
             let project = find_project(&catalog, project_id)?;
-            if matches!(project.state.as_str(), "CONFLICTED" | "FAILED") {
+            if matches!(
+                project.state.as_str(),
+                "CONFLICTED" | "FAILED" | "ACCESS_LOST"
+            ) {
                 return Ok(blocked(project));
             }
         }
@@ -447,130 +552,446 @@ impl ResyncDaemon {
         Ok(serde_json::to_value(result?)?)
     }
 
-    async fn publish(&self, request: &Value) -> Result<Value> {
-        let project_id = string_field(request, "project_id")?.to_owned();
-        let requested_branch = request
-            .get("branch")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let gate = self.gate(&project_id);
+    async fn enqueue_publication(
+        &self,
+        project_id: &str,
+        branch: &str,
+        commit_oid: &str,
+    ) -> Result<String> {
+        let project = {
+            let catalog = self.inner.catalog.lock().await;
+            find_project(&catalog, project_id)?.clone()
+        };
+        let verified = git(
+            &project.local_path,
+            ["rev-parse", "--verify", &format!("{commit_oid}^{{commit}}")],
+            RunOptions::default(),
+        )?
+        .stdout
+        .trim()
+        .to_owned();
+        if verified != commit_oid {
+            bail!("reported commit does not resolve to the requested OID");
+        }
+        {
+            let queue = self.inner.publications.lock().await;
+            if let Some(existing) = queue.publications.iter().find(|value| {
+                value.pending()
+                    && value.project_id == project.project_id
+                    && value.branch == branch
+                    && value.source_commit_oid == commit_oid
+            }) {
+                return Ok(existing.publication_id.clone());
+            }
+        }
+        let publication = Publication::new(
+            &project.project_id,
+            project.checkout_id.clone(),
+            branch,
+            commit_oid,
+            project.advertised_heads.get(branch).cloned(),
+        );
+        git(
+            &project.local_path,
+            [
+                "update-ref",
+                &format!("refs/resync/publications/{}", publication.publication_id),
+                commit_oid,
+            ],
+            RunOptions::default(),
+        )?;
+        {
+            let mut queue = self.inner.publications.lock().await;
+            queue.publications.push(publication.clone());
+            queue.persist(&self.inner.paths)?;
+        }
+        {
+            let mut catalog = self.inner.catalog.lock().await;
+            let project = find_project_mut(&mut catalog, project_id)?;
+            project.durability = "COMMITTED_UNPUBLISHED".into();
+            self.persist(&catalog).await?;
+        }
+        self.schedule_publications();
+        Ok(publication.publication_id)
+    }
+
+    fn schedule_publications(&self) {
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            let _ = daemon.process_publications(false).await;
+        });
+    }
+
+    async fn process_publications(&self, force: bool) -> Result<()> {
+        let _processing = self.inner.publication_processing.lock().await;
+        let mut pending = {
+            let queue = self.inner.publications.lock().await;
+            queue
+                .publications
+                .iter()
+                .filter(|value| value.pending() && (force || value.due()))
+                .map(|value| (value.created_at.clone(), value.publication_id.clone()))
+                .collect::<Vec<_>>()
+        };
+        pending.sort_by(|left, right| right.0.cmp(&left.0));
+        for (_, publication_id) in pending {
+            let publication = {
+                let queue = self.inner.publications.lock().await;
+                queue
+                    .publications
+                    .iter()
+                    .find(|value| value.publication_id == publication_id && value.pending())
+                    .cloned()
+            };
+            let Some(publication) = publication else {
+                continue;
+            };
+            if let Err(error) = self.deliver_publication(&publication).await {
+                let mut queue = self.inner.publications.lock().await;
+                if let Some(value) = queue
+                    .publications
+                    .iter_mut()
+                    .find(|value| value.publication_id == publication_id)
+                {
+                    value.record_failure(&error, Duration::from_secs(60));
+                }
+                queue.persist(&self.inner.paths)?;
+                drop(queue);
+                let mut catalog = self.inner.catalog.lock().await;
+                if let Ok(project) = find_project_mut(&mut catalog, &publication.project_id) {
+                    project.durability = "COMMITTED_UNPUBLISHED".into();
+                    project.last_error = Some(format!("{error:#}"));
+                }
+                self.persist(&catalog).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn deliver_publication(&self, publication: &Publication) -> Result<()> {
+        let gate = self.gate(&publication.project_id);
         gate.begin_exclusive().await;
-        let result = self
-            .publish_exclusive(&project_id, requested_branch.as_deref())
-            .await;
+        let result = self.deliver_publication_exclusive(publication).await;
         gate.end_exclusive().await;
         result
     }
 
-    async fn publish_exclusive(
-        &self,
-        project_id: &str,
-        requested_branch: Option<&str>,
-    ) -> Result<Value> {
-        for attempt in 1..=5 {
-            let mut catalog = self.inner.catalog.lock().await;
-            let project = find_project_mut(&mut catalog, project_id)?;
-            project.advertised_heads = fetch_remote(project, self.inner.config.token.as_deref())?;
-            let branch = current_branch(&project.local_path)?;
-            if requested_branch.is_some_and(|value| value != branch) {
-                bail!(
-                    "cannot publish {}; active branch is now {branch}",
-                    requested_branch.unwrap()
-                );
+    async fn deliver_publication_exclusive(&self, initial: &Publication) -> Result<()> {
+        for _ in 0..5 {
+            let mut publication = {
+                let queue = self.inner.publications.lock().await;
+                queue
+                    .publications
+                    .iter()
+                    .find(|value| value.publication_id == initial.publication_id)
+                    .cloned()
+                    .context("publication disappeared from queue")?
+            };
+            if !publication.pending() {
+                return Ok(());
             }
-            let reconciliation = self.reconcile_project(project)?;
-            if reconciliation.outcome == "conflict" {
-                self.persist(&catalog).await?;
-                return Ok(serde_json::to_value(reconciliation)?);
-            }
-            let head = git(
-                &project.local_path,
-                ["rev-parse", "HEAD"],
-                RunOptions::default(),
-            )?
-            .stdout
-            .trim()
-            .to_owned();
-            let configuration = read_project_config(&project.local_path)?;
-            if !configuration.validations.is_empty() {
-                let validation_path = self
-                    .inner
-                    .paths
-                    .root
-                    .join(format!("validation-{}", Uuid::new_v4()));
-                let validation = (|| -> Result<()> {
-                    git(
-                        &project.local_path,
-                        [
-                            "worktree",
-                            "add",
-                            "--detach",
-                            validation_path.to_string_lossy().as_ref(),
-                            &head,
-                        ],
-                        RunOptions::default(),
-                    )?;
-                    for command in configuration.validations {
-                        run(
-                            &command[0],
-                            command.iter().skip(1),
-                            RunOptions {
-                                cwd: Some(validation_path.clone()),
-                                ..RunOptions::default()
-                            },
-                        )?;
+            let project = {
+                let catalog = self.inner.catalog.lock().await;
+                find_project(&catalog, &publication.project_id)?.clone()
+            };
+            let remote_head = fetch_remote_branch(
+                &project,
+                &publication.branch,
+                self.inner.config.token.as_deref(),
+            )?;
+            let candidate_reachable = remote_head.as_deref().is_some_and(|remote| {
+                is_ancestor(
+                    &project.local_path,
+                    &publication.candidate_commit_oid,
+                    remote,
+                )
+                .unwrap_or(false)
+            });
+            if !candidate_reachable && remote_head != publication.expected_remote_oid {
+                if current_branch(&project.local_path).ok().as_deref() != Some(&publication.branch)
+                {
+                    bail!(
+                        "remote branch {} advanced while it is inactive; publication remains queued",
+                        publication.branch
+                    );
+                }
+                let candidate = {
+                    let mut catalog = self.inner.catalog.lock().await;
+                    let project = find_project_mut(&mut catalog, &publication.project_id)?;
+                    match &remote_head {
+                        Some(value) => {
+                            project
+                                .advertised_heads
+                                .insert(publication.branch.clone(), value.clone());
+                        }
+                        None => {
+                            project.advertised_heads.remove(&publication.branch);
+                        }
                     }
-                    Ok(())
-                })();
-                let cleanup = RunOptions {
-                    allow_failure: true,
-                    ..RunOptions::default()
+                    let reconciliation = self.reconcile_project(project)?;
+                    if reconciliation.outcome == "conflict" {
+                        self.persist(&catalog).await?;
+                        bail!("publication is blocked by a reconciliation conflict");
+                    }
+                    let candidate = git(
+                        &project.local_path,
+                        ["rev-parse", "HEAD"],
+                        RunOptions::default(),
+                    )?
+                    .stdout
+                    .trim()
+                    .to_owned();
+                    self.persist(&catalog).await?;
+                    candidate
                 };
-                let _ = git(
+                let mut queue = self.inner.publications.lock().await;
+                let queued = queue
+                    .publications
+                    .iter_mut()
+                    .find(|value| value.publication_id == publication.publication_id)
+                    .context("publication disappeared from queue")?;
+                queued.attempt += 1;
+                queued.candidate_commit_oid = candidate;
+                queued.expected_remote_oid = remote_head;
+                queued.last_error = None;
+                queued.next_attempt_at = Some(chrono::Utc::now().to_rfc3339());
+                queue.persist(&self.inner.paths)?;
+                continue;
+            }
+            if !candidate_reachable {
+                self.validate_candidate(&project, &publication.candidate_commit_oid)?;
+                let expected = publication.expected_remote_oid.as_deref().unwrap_or("");
+                let pushed = git(
                     &project.local_path,
                     [
-                        "worktree",
-                        "remove",
-                        "--force",
-                        validation_path.to_string_lossy().as_ref(),
+                        "push",
+                        &format!(
+                            "--force-with-lease=refs/heads/{}:{expected}",
+                            publication.branch
+                        ),
+                        &project.remote_name,
+                        &format!(
+                            "{}:refs/heads/{}",
+                            publication.candidate_commit_oid, publication.branch
+                        ),
                     ],
-                    cleanup,
-                );
-                validation?;
+                    RunOptions {
+                        env: authorization_env(self.inner.config.token.as_deref()),
+                        allow_failure: true,
+                        ..RunOptions::default()
+                    },
+                )?;
+                if pushed.code != 0 {
+                    bail!("{}", pushed.stderr.trim());
+                }
             }
-            project.durability = "PUBLISHING".into();
-            let local_path = project.local_path.clone();
-            let remote_name = project.remote_name.clone();
-            self.persist(&catalog).await?;
-            let options = RunOptions {
-                env: authorization_env(self.inner.config.token.as_deref()),
-                allow_failure: true,
-                ..RunOptions::default()
+            let confirmed_head = fetch_remote_branch(
+                &project,
+                &publication.branch,
+                self.inner.config.token.as_deref(),
+            )?
+            .context("hosted branch is missing after publication")?;
+            if !is_ancestor(
+                &project.local_path,
+                &publication.candidate_commit_oid,
+                &confirmed_head,
+            )? {
+                bail!("published candidate is not reachable from the hosted branch");
+            }
+            publication.last_attempt_at = Some(chrono::Utc::now().to_rfc3339());
+            let ack = match (
+                project.service.as_deref(),
+                self.inner.config.token.as_deref(),
+            ) {
+                (Some(service), Some(token)) => {
+                    let service = service.to_owned();
+                    let token = token.to_owned();
+                    let request = publication.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        acknowledge_with_provider(&service, &token, &request)
+                    })
+                    .await??
+                    {
+                        ProviderPublication::Acknowledged(ack) => ack,
+                        ProviderPublication::RemoteAdvanced {
+                            remote_head,
+                            project_generation,
+                        } => {
+                            bail!(
+                                "provider reported REMOTE_ADVANCED at {:?} (generation {})",
+                                remote_head,
+                                project_generation
+                            )
+                        }
+                    }
+                }
+                _ => PublicationAck {
+                    publication_id: publication.publication_id.clone(),
+                    attempt: publication.attempt,
+                    project_id: publication.project_id.clone(),
+                    branch: publication.branch.clone(),
+                    accepted_oid: publication.candidate_commit_oid.clone(),
+                    remote_head: confirmed_head,
+                    project_generation: project.server_generation,
+                    durable: true,
+                },
             };
-            let pushed = git(
-                &local_path,
-                ["push", &remote_name, &format!("HEAD:refs/heads/{branch}")],
-                options,
-            )?;
-            if pushed.code == 0 {
-                let project = find_project_mut(&mut catalog, project_id)?;
-                project
-                    .last_applied_heads
-                    .insert(branch.clone(), head.clone());
-                project.advertised_heads.insert(branch, head.clone());
-                project.state = "CURRENT".into();
-                project.durability = "REMOTELY_DURABLE".into();
-                self.persist(&catalog).await?;
-                return Ok(json!({ "outcome": "published", "head": head, "attempt": attempt }));
-            }
-            if !["non-fast-forward", "fetch first", "rejected"]
-                .iter()
-                .any(|value| pushed.stderr.to_lowercase().contains(value))
-            {
-                bail!("{}", pushed.stderr.trim());
-            }
+            self.complete_publication(&publication, ack).await?;
+            return Ok(());
         }
         bail!("publication lost the remote race five times")
+    }
+
+    fn validate_candidate(&self, project: &LocalProject, candidate: &str) -> Result<()> {
+        let configuration = read_project_config(&project.local_path)?;
+        if configuration.validations.is_empty() {
+            return Ok(());
+        }
+        let validation_path = self
+            .inner
+            .paths
+            .root
+            .join(format!("validation-{}", Uuid::new_v4()));
+        let validation = (|| -> Result<()> {
+            git(
+                &project.local_path,
+                [
+                    "worktree",
+                    "add",
+                    "--detach",
+                    validation_path.to_string_lossy().as_ref(),
+                    candidate,
+                ],
+                RunOptions::default(),
+            )?;
+            for command in configuration.validations {
+                run(
+                    &command[0],
+                    command.iter().skip(1),
+                    RunOptions {
+                        cwd: Some(validation_path.clone()),
+                        ..RunOptions::default()
+                    },
+                )?;
+            }
+            Ok(())
+        })();
+        let _ = git(
+            &project.local_path,
+            [
+                "worktree",
+                "remove",
+                "--force",
+                validation_path.to_string_lossy().as_ref(),
+            ],
+            RunOptions {
+                allow_failure: true,
+                ..RunOptions::default()
+            },
+        );
+        validation
+    }
+
+    async fn complete_publication(
+        &self,
+        publication: &Publication,
+        ack: PublicationAck,
+    ) -> Result<()> {
+        let mut completed = Vec::new();
+        let has_pending = {
+            let mut queue = self.inner.publications.lock().await;
+            for value in &mut queue.publications {
+                if value.pending()
+                    && value.project_id == publication.project_id
+                    && value.branch == publication.branch
+                    && value.created_at <= publication.created_at
+                {
+                    value.state = ACKNOWLEDGED.into();
+                    value.last_attempt_at = Some(chrono::Utc::now().to_rfc3339());
+                    value.next_attempt_at = None;
+                    value.last_error = None;
+                    value.ack = Some(ack.clone());
+                    completed.push(value.publication_id.clone());
+                }
+            }
+            queue.compact();
+            queue.persist(&self.inner.paths)?;
+            queue
+                .publications
+                .iter()
+                .any(|value| value.pending() && value.project_id == publication.project_id)
+        };
+        let project_path = {
+            let mut catalog = self.inner.catalog.lock().await;
+            let project = find_project_mut(&mut catalog, &publication.project_id)?;
+            project
+                .advertised_heads
+                .insert(publication.branch.clone(), ack.remote_head.clone());
+            project
+                .last_applied_heads
+                .insert(publication.branch.clone(), ack.remote_head.clone());
+            project.server_generation = project.server_generation.max(ack.project_generation);
+            project.last_error = None;
+            if !has_pending {
+                project.durability = "REMOTELY_DURABLE".into();
+            }
+            let path = project.local_path.clone();
+            self.persist(&catalog).await?;
+            path
+        };
+        for id in completed {
+            let _ = git(
+                &project_path,
+                [
+                    "update-ref",
+                    "-d",
+                    &format!("refs/resync/publications/{id}"),
+                ],
+                RunOptions {
+                    allow_failure: true,
+                    ..RunOptions::default()
+                },
+            );
+        }
+        Ok(())
+    }
+
+    async fn publish(&self, request: &Value) -> Result<Value> {
+        let project_id = string_field(request, "project_id")?.to_owned();
+        let project = {
+            let catalog = self.inner.catalog.lock().await;
+            find_project(&catalog, &project_id)?.clone()
+        };
+        let branch = request
+            .get("branch")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or(current_branch(&project.local_path)?);
+        let head = git(
+            &project.local_path,
+            ["rev-parse", &format!("refs/heads/{branch}")],
+            RunOptions::default(),
+        )?
+        .stdout
+        .trim()
+        .to_owned();
+        self.enqueue_publication(&project_id, &branch, &head)
+            .await?;
+        self.process_publications(true).await?;
+        let queue = self.inner.publications.lock().await;
+        let pending = queue.publications.iter().find(|value| {
+            value.pending() && value.project_id == project_id && value.branch == branch
+        });
+        if let Some(value) = pending {
+            bail!(
+                "{}",
+                value
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("publication remains pending")
+            );
+        }
+        Ok(json!({ "outcome": "published", "head": head, "queue_depth": 0 }))
     }
 
     pub async fn handle(&self, request: Value) -> Result<Value> {
@@ -585,15 +1006,53 @@ impl ResyncDaemon {
                 migrate_projects(&mut loaded.projects);
                 *self.inner.catalog.lock().await = loaded;
                 self.refresh().await?;
+                let daemon = self.clone();
+                tokio::spawn(async move {
+                    let _ = daemon.process_publications(true).await;
+                });
                 Ok(json!({ "reloaded": self.inner.catalog.lock().await.projects.len() }))
             }
             "status" => {
                 let catalog = self.inner.catalog.lock().await;
-                let projects: Vec<&LocalProject> =
+                let projects: Vec<LocalProject> =
                     match request.get("project_id").and_then(Value::as_str) {
-                        Some(id) => vec![find_project(&catalog, id)?],
-                        None => catalog.projects.iter().collect(),
+                        Some(id) => vec![find_project(&catalog, id)?.clone()],
+                        None => catalog.projects.clone(),
                     };
+                let queue = self.inner.publications.lock().await;
+                let projects = projects
+                    .into_iter()
+                    .map(|project| {
+                        let pending = queue
+                            .publications
+                            .iter()
+                            .filter(|value| {
+                                value.pending() && value.project_id == project.project_id
+                            })
+                            .collect::<Vec<_>>();
+                        let mut value = serde_json::to_value(&project)?;
+                        value["queueDepth"] = json!(pending.len());
+                        value["oldestPendingAt"] = pending
+                            .iter()
+                            .map(|item| item.created_at.as_str())
+                            .min()
+                            .map(|item| Value::String(item.into()))
+                            .unwrap_or(Value::Null);
+                        value["lastPublicationAttemptAt"] = pending
+                            .iter()
+                            .filter_map(|item| item.last_attempt_at.as_deref())
+                            .max()
+                            .map(|item| Value::String(item.into()))
+                            .unwrap_or(Value::Null);
+                        value["nextPublicationAttemptAt"] = pending
+                            .iter()
+                            .filter_map(|item| item.next_attempt_at.as_deref())
+                            .min()
+                            .map(|item| Value::String(item.into()))
+                            .unwrap_or(Value::Null);
+                        anyhow::Ok(value)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(json!({ "projects": projects }))
             }
             "acquireAccess" => self.acquire(&request).await,
@@ -602,26 +1061,40 @@ impl ResyncDaemon {
             "publish" => self.publish(&request).await,
             "reportCommit" => {
                 let project_id = string_field(&request, "project_id")?.to_owned();
+                let branch = string_field(&request, "branch")?;
+                let commit_oid = string_field(&request, "commit_oid")?;
+                let publication_id = self
+                    .enqueue_publication(&project_id, branch, commit_oid)
+                    .await?;
+                Ok(json!({
+                    "queued": true,
+                    "publication_id": publication_id,
+                    "commit_oid": commit_oid
+                }))
+            }
+            "reportCheckout" => {
+                let project_id = string_field(&request, "project_id")?.to_owned();
+                let new_branch = string_field(&request, "new_branch")?.to_owned();
+                let previous_oid = string_field(&request, "previous_oid")?.to_owned();
+                let previous_branch = {
+                    let catalog = self.inner.catalog.lock().await;
+                    find_project(&catalog, &project_id)?.active_branch.clone()
+                };
+                if let Some(previous_branch) = previous_branch
+                    && previous_branch != new_branch
+                    && previous_oid.chars().any(|value| value != '0')
+                {
+                    self.enqueue_publication(&project_id, &previous_branch, &previous_oid)
+                        .await?;
+                }
                 {
                     let mut catalog = self.inner.catalog.lock().await;
-                    find_project_mut(&mut catalog, &project_id)?.durability =
-                        "COMMITTED_UNPUBLISHED".into();
+                    find_project_mut(&mut catalog, &project_id)?.active_branch =
+                        Some(new_branch.clone());
                     self.persist(&catalog).await?;
                 }
-                let daemon = self.clone();
-                let branch = request
-                    .get("branch")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                tokio::spawn(async move {
-                    if let Err(error) = daemon
-                        .publish(&json!({ "project_id": project_id, "branch": branch }))
-                        .await
-                    {
-                        eprintln!("automatic publication failed: {error:#}");
-                    }
-                });
-                Ok(json!({ "scheduled": true, "commit_oid": request.get("commit_oid") }))
+                let _ = self.refresh().await;
+                Ok(json!({ "recorded": true, "active_branch": new_branch }))
             }
             method => bail!("unknown daemon method {method}"),
         }
@@ -788,9 +1261,14 @@ pub async fn run_daemon(poll_interval: Duration) -> Result<()> {
             let jitter = rand::thread_rng().gen_range(0..1000);
             tokio::time::sleep(refresh.inner.poll_interval + Duration::from_millis(jitter)).await;
             let _ = refresh.refresh().await;
+            let _ = refresh.process_publications(false).await;
         }
     });
     let _ = daemon.refresh().await;
+    let replay = daemon.clone();
+    tokio::spawn(async move {
+        let _ = replay.process_publications(true).await;
+    });
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {

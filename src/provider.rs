@@ -20,6 +20,8 @@ pub struct Discovery {
     pub service_id: String,
     #[serde(default)]
     pub auth_methods: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub endpoints: BTreeMap<String, String>,
     #[serde(skip)]
     pub origin: String,

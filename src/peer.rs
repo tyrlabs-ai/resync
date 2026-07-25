@@ -424,6 +424,16 @@ fn peer_destination(
 pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
     let discovery = discover(Some(options.provider))?;
     let existing_token = load_credential(&discovery.origin)?;
+    if existing_token.is_some()
+        && !discovery
+            .capabilities
+            .iter()
+            .any(|value| value == "membership-extension-v1")
+    {
+        bail!(
+            "provider cannot guarantee membership extension; refusing to replace the active device identity"
+        );
+    }
     let key = generate_device_identity(options.device_name)?;
     let endpoint = discovery
         .endpoints
@@ -549,6 +559,7 @@ mod tests {
             protocol: "resync.v1".into(),
             service_id: "test".into(),
             auth_methods: Vec::new(),
+            capabilities: Vec::new(),
             endpoints: BTreeMap::from([(
                 "join_tickets".into(),
                 "https://provider.example/v1/projects/%7Bproject_id%7D/join-tickets".into(),

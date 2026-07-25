@@ -10,12 +10,15 @@ use crate::protocol::CatalogProject;
 use crate::provider::{default_provider, discover, enroll_with_token, provider_fetch};
 use crate::remote::{fetch_catalog, materialize_project, resolved_config};
 use crate::rpc::rpc;
-use crate::state::{LocalProject, load_catalog, load_config_raw, state_paths, write_json};
+use crate::state::{
+    LocalProject, load_catalog, load_config_raw, read_json, state_paths, write_json,
+};
 use crate::transaction::recover_transaction;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use reqwest::Method;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -94,6 +97,13 @@ enum Command {
         project_id: String,
         commit_oid: String,
         branch: String,
+    },
+    #[command(name = "report-checkout", hide = true)]
+    ReportCheckout {
+        project_id: String,
+        previous_oid: String,
+        new_oid: String,
+        new_branch: String,
     },
 }
 
@@ -270,6 +280,7 @@ fn preprocess_arguments() -> Vec<String> {
         "release",
         "codex-hook",
         "report-commit",
+        "report-checkout",
         "help",
     ];
     let value = args[index].clone();
@@ -351,6 +362,18 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             branch,
         } => Ok(Some(daemon_rpc(&json!({
             "method": "reportCommit", "project_id": project_id, "commit_oid": commit_oid, "branch": branch
+        }))?)),
+        Command::ReportCheckout {
+            project_id,
+            previous_oid,
+            new_oid,
+            new_branch,
+        } => Ok(Some(daemon_rpc(&json!({
+            "method": "reportCheckout",
+            "project_id": project_id,
+            "previous_oid": previous_oid,
+            "new_oid": new_oid,
+            "new_branch": new_branch
         }))?)),
     }
 }
@@ -497,11 +520,55 @@ fn project_create(arguments: ProjectCreateArgs, fork: bool) -> Result<Value> {
     let root = repository_root(&std::env::current_dir()?)?;
     let prior = read_identity(&root)?;
     if let Some(prior_project) = prior.project_id.as_deref().filter(|_| !fork) {
-        bail!(
-            "checkout already belongs to {} / {}; use `resync project fork` to separate it",
-            prior.service.as_deref().unwrap_or_default(),
-            prior_project
-        );
+        let prior_service = prior
+            .service
+            .as_deref()
+            .context("existing RepoSync identity has no provider")?;
+        if let Some(requested) = arguments.provider.as_deref()
+            && canonical_origin(requested)? != canonical_origin(prior_service)?
+        {
+            bail!(
+                "checkout already belongs to {prior_service} / {prior_project}; use `resync project fork` to separate it"
+            );
+        }
+        let auth = configured_provider(Some(prior_service))?;
+        let remote = fetch_catalog(&crate::state::Config {
+            server: Some(auth.origin.clone()),
+            token: Some(auth.token.clone()),
+            ..crate::state::Config::default()
+        })?;
+        let selected = remote
+            .projects
+            .iter()
+            .find(|item| item.project_id == prior_project)
+            .with_context(|| {
+                format!(
+                    "ACCESS_LOST: device membership for {prior_project} is missing; redeem a new join ticket from an authorized peer"
+                )
+            })?;
+        let existing = load_catalog()?
+            .projects
+            .into_iter()
+            .find(|item| item.project_id == prior_project && item.local_path == root);
+        let mut local = match existing {
+            Some(local) => local,
+            None => materialize_project(selected, &root, Some(&auth.token), "resync")?,
+        };
+        local.remote_url = selected.remote_url.clone();
+        local.default_branch = selected.default_branch.clone();
+        local.server_generation = selected.project_generation;
+        local.service = prior.service.clone();
+        local.checkout_id = prior.checkout_id.clone();
+        ensure_project_config(&root)?;
+        persist_project(local.clone(), Some(remote.catalog_generation))?;
+        install_adapters(prior_project)?;
+        daemon_rpc(&json!({ "method": "reload" }))?;
+        let _ = daemon_rpc(&json!({ "method": "sync", "project_id": prior_project }))?;
+        let _ = daemon_rpc(&json!({ "method": "publish", "project_id": prior_project }))?;
+        let mut value = serde_json::to_value(local)?;
+        value["operation"] = Value::String("repaired".into());
+        value["identityPreserved"] = Value::Bool(true);
+        return Ok(value);
     }
     let auth = configured_provider(arguments.provider.as_deref())?;
     let default_branch = git(
@@ -523,11 +590,39 @@ fn project_create(arguments: ProjectCreateArgs, fork: bool) -> Result<Value> {
         .endpoints
         .get("projects")
         .context("provider discovery is missing projects endpoint")?;
+    let creation_directory = state_paths().root.join("project-creations");
+    let creation_name = format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{}\0{}\0{}",
+                auth.origin,
+                root.display(),
+                if fork { "fork" } else { "init" }
+            )
+            .as_bytes()
+        )
+    );
+    let creation_path = creation_directory.join(format!("{creation_name}.json"));
+    let mut creation: Value = read_json(&creation_path, json!({}))?;
+    let idempotency_key = creation
+        .get("idempotencyKey")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("pcr_{}", uuid::Uuid::new_v4().simple()));
+    creation["idempotencyKey"] = Value::String(idempotency_key.clone());
+    creation["provider"] = Value::String(auth.origin.clone());
+    creation["repository"] = Value::String(root.to_string_lossy().into_owned());
+    write_json(&creation_path, &creation, 0o600)?;
     let created = provider_fetch(
         endpoint,
         Some(&auth.token),
         Method::POST,
-        Some(&json!({ "name": name, "default_branch": default_branch })),
+        Some(&json!({
+            "name": name,
+            "default_branch": default_branch,
+            "idempotency_key": idempotency_key
+        })),
     )?;
     let catalog_project: CatalogProject = serde_json::from_value(created.clone())?;
     let mut local = materialize_project(&catalog_project, &root, Some(&auth.token), "resync")?;
@@ -538,6 +633,10 @@ fn project_create(arguments: ProjectCreateArgs, fork: bool) -> Result<Value> {
     persist_project(local.clone(), None)?;
     install_adapters(&local.project_id)?;
     daemon_rpc(&json!({ "method": "reload" }))?;
+    fs::remove_file(&creation_path)?;
+    if let Some(parent) = creation_path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     let mut value = serde_json::to_value(local)?;
     value["operation"] = Value::String(if fork { "forked" } else { "initialized" }.into());
     value["previousProjectId"] = prior.project_id.map(Value::String).unwrap_or(Value::Null);
@@ -780,9 +879,70 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
     fs::write(&hook_path, script)?;
     #[cfg(unix)]
     fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755))?;
+    let checkout_hook = hook_directory.join("post-checkout");
+    let previous_checkout = hook_directory.join("post-checkout.pre-resync");
+    if checkout_hook.exists()
+        && !fs::read_to_string(&checkout_hook)?.contains("# RepoSync dispatcher")
+    {
+        fs::rename(&checkout_hook, &previous_checkout)?;
+    }
+    let checkout_script = format!(
+        "#!/bin/sh\n# RepoSync dispatcher\nset -u\n[ ! -x \"$0.pre-resync\" ] || \"$0.pre-resync\" \"$@\"\nnew_branch=\"$(git symbolic-ref --short HEAD 2>/dev/null)\" || exit 0\n{} report-checkout {} \"$1\" \"$2\" \"$new_branch\" >/dev/null || echo \"RepoSync could not record branch transition\" >&2\n",
+        shell_quote(&executable.to_string_lossy()),
+        shell_quote(project_id)
+    );
+    fs::write(&checkout_hook, checkout_script)?;
+    #[cfg(unix)]
+    fs::set_permissions(&checkout_hook, fs::Permissions::from_mode(0o755))?;
+    let supervision = ensure_daemon_supervision()?;
     Ok(
-        json!({ "projectId": project_id, "codexHooks": hooks_path, "codexSkill": skill_path, "gitHook": hook_path, "requiresCodexTrustReview": true }),
+        json!({ "projectId": project_id, "codexHooks": hooks_path, "codexSkill": skill_path,
+            "gitHooks": { "postCommit": hook_path, "postCheckout": checkout_hook },
+            "daemonSupervision": supervision,
+            "requiresCodexTrustReview": true }),
     )
+}
+
+fn ensure_daemon_supervision() -> Result<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        let available = run_process(
+            "systemctl",
+            ["--user", "show-environment"],
+            RunOptions {
+                allow_failure: true,
+                ..RunOptions::default()
+            },
+        )
+        .is_ok_and(|value| value.code == 0);
+        if available {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is unavailable")?;
+            let directory = home.join(".config/systemd/user");
+            fs::create_dir_all(&directory)?;
+            let executable = std::env::current_exe()?;
+            fs::write(
+                directory.join("resync.service"),
+                format!(
+                    "[Unit]\nDescription=RepoSync convergence daemon\nAfter=network-online.target\n\n[Service]\nExecStart={} daemon\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+                    executable.display()
+                ),
+            )?;
+            run_process(
+                "systemctl",
+                ["--user", "daemon-reload"],
+                RunOptions::default(),
+            )?;
+            run_process(
+                "systemctl",
+                ["--user", "enable", "--now", "resync.service"],
+                RunOptions::default(),
+            )?;
+            return Ok("systemd-user");
+        }
+    }
+    Ok("hook-started")
 }
 
 fn ensure_local_excludes(project_path: &Path, patterns: &[&str]) -> Result<()> {

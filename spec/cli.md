@@ -43,9 +43,13 @@ install-adapters <project>           # repair/reinstall; enrollment does this au
 Compatibility aliases from the engineering preview MAY remain, but grouped commands are canonical. A non-command first positional value is treated as an SSH target only while inside an enrolled Git checkout; unknown command-like values outside that context produce help and an error.
 
 `init`, `join`, `fork`, and peer enrollment install the project-local RepoSync
-skill and lifecycle adapters, then ensure the per-user daemon is running. An
-ordinary `git commit` schedules publication automatically. `project publish`
-is an explicit retry/flush command and is not part of the normal workflow.
+skill, `post-commit` and `post-checkout` lifecycle adapters, then ensure the
+per-user daemon is running. `init` is idempotent for an already enrolled
+checkout: it verifies membership, repairs adapters and daemon registration,
+reconciles the active branch, and flushes pending work without changing
+project, checkout, or device identity. An ordinary `git commit` durably queues
+publication automatically. `project publish` is an explicit retry/flush
+command and is not part of the normal workflow.
 
 Examples:
 
