@@ -337,18 +337,22 @@ fn checkout_transition_recovers_a_missed_post_commit() -> anyhow::Result<()> {
             },
         )?;
         if result.stdout.trim() == expected {
-            let queue: serde_json::Value =
-                serde_json::from_slice(&fs::read(state.join("publications.json"))?)?;
-            assert!(
-                queue["publications"]
+            let queue_path = state.join("publications.json");
+            if queue_path.exists() {
+                let queue: serde_json::Value = serde_json::from_slice(&fs::read(queue_path)?)?;
+                if queue["publications"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|value| value["branch"] == "main"
-                        && value["sourceCommitOid"] == expected
-                        && value["state"] == "ACKNOWLEDGED")
-            );
-            return Ok(());
+                    .any(|value| {
+                        value["branch"] == "main"
+                            && value["sourceCommitOid"] == expected
+                            && value["state"] == "ACKNOWLEDGED"
+                    })
+                {
+                    return Ok(());
+                }
+            }
         }
         thread::sleep(Duration::from_millis(50));
     }
