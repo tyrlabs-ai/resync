@@ -97,6 +97,7 @@ fn current_target() -> Option<&'static str> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn linux_binary_is_static(binary: &[u8]) -> Result<bool> {
     if binary.get(..6) != Some(b"\x7fELF\x02\x01") {
         bail!("Linux peer bootstrap requires a 64-bit little-endian ELF binary");
@@ -531,6 +532,7 @@ mod tests {
         assert!(!replaced);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_peer_bootstrap_rejects_dynamic_elf_binaries() {
         let mut elf = vec![0_u8; 64 + 56];

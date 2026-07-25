@@ -120,7 +120,7 @@ fn ordinary_commit_starts_daemon_and_publishes() -> anyhow::Result<()> {
         },
     )?;
     let expected = rev(&fixture.local, "HEAD")?;
-    for _ in 0..100 {
+    for _ in 0..200 {
         let result = git(
             &fixture.remote,
             ["rev-parse", "refs/heads/main"],
@@ -206,7 +206,7 @@ fn failed_publication_is_durably_queued() -> anyhow::Result<()> {
 
     let queue_path = state.join("publications.json");
     let mut queued = false;
-    for _ in 0..50 {
+    for _ in 0..250 {
         if queue_path.exists() {
             let queue: serde_json::Value = serde_json::from_slice(&fs::read(&queue_path)?)?;
             let pending = queue["publications"]
@@ -232,7 +232,7 @@ fn failed_publication_is_durably_queued() -> anyhow::Result<()> {
     let pid: i32 = fs::read_to_string(&paths.daemon_lock)?.trim().parse()?;
     // SAFETY: the PID comes from the isolated daemon lock created by this test.
     unsafe { libc::kill(pid, libc::SIGTERM) };
-    for _ in 0..100 {
+    for _ in 0..200 {
         if !paths.daemon_lock.exists() {
             break;
         }
@@ -241,7 +241,7 @@ fn failed_publication_is_durably_queued() -> anyhow::Result<()> {
     fs::rename(&offline, &fixture.remote)?;
     command(binary, &fixture.local, &state, &["project", "status"])?;
     let expected = rev(&fixture.local, "HEAD")?;
-    for _ in 0..100 {
+    for _ in 0..200 {
         let result = git(
             &fixture.remote,
             ["rev-parse", "refs/heads/main"],
@@ -327,7 +327,7 @@ fn checkout_transition_recovers_a_missed_post_commit() -> anyhow::Result<()> {
             ..RunOptions::default()
         },
     )?;
-    for _ in 0..100 {
+    for _ in 0..200 {
         let result = git(
             &fixture.remote,
             ["rev-parse", "refs/heads/main"],

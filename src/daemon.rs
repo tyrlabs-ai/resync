@@ -1380,7 +1380,7 @@ pub fn daemon_rpc(request: &Value) -> Result<Value> {
     }
     command.spawn()?;
     let mut last = None;
-    for _ in 0..50 {
+    for _ in 0..150 {
         std::thread::sleep(Duration::from_millis(100));
         match crate::rpc::rpc(&json!({ "method": "ping" }), None) {
             Ok(ping) if daemon_matches_client(&ping, &binary_id) => {
