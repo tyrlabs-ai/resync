@@ -97,9 +97,65 @@ fn current_target() -> Option<&'static str> {
     }
 }
 
+fn linux_binary_is_static(binary: &[u8]) -> Result<bool> {
+    if binary.get(..6) != Some(b"\x7fELF\x02\x01") {
+        bail!("Linux peer bootstrap requires a 64-bit little-endian ELF binary");
+    }
+    let program_offset = u64::from_le_bytes(
+        binary
+            .get(32..40)
+            .context("ELF header is missing the program table offset")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let entry_size = u16::from_le_bytes(
+        binary
+            .get(54..56)
+            .context("ELF header is missing the program entry size")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let entry_count = u16::from_le_bytes(
+        binary
+            .get(56..58)
+            .context("ELF header is missing the program entry count")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    if entry_size < 4 {
+        bail!("ELF program entries are too small");
+    }
+    for index in 0..entry_count {
+        let offset = program_offset
+            .checked_add(
+                index
+                    .checked_mul(entry_size)
+                    .context("ELF program table overflow")?,
+            )
+            .context("ELF program table overflow")?;
+        let program_type = u32::from_le_bytes(
+            binary
+                .get(offset..offset + 4)
+                .context("ELF program table is truncated")?
+                .try_into()
+                .unwrap(),
+        );
+        if program_type == 3 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn release_binary(target: &str) -> Result<Vec<u8>> {
     if current_target() == Some(target) {
-        return Ok(fs::read(std::env::current_exe()?)?);
+        let binary = fs::read(std::env::current_exe()?)?;
+        #[cfg(target_os = "linux")]
+        if linux_binary_is_static(&binary)? {
+            return Ok(binary);
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Ok(binary);
     }
     let version = env!("CARGO_PKG_VERSION");
     let base = std::env::var("RESYNC_RELEASE_BASE").unwrap_or_else(|_| {
@@ -419,14 +475,27 @@ pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        peer_destination, remote_home_path, remote_install_script, remote_target_with_ssh,
-        ticket_endpoint,
+        linux_binary_is_static, peer_destination, remote_home_path, remote_install_script,
+        remote_target_with_ssh, ticket_endpoint,
     };
     use crate::provider::Discovery;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    #[test]
+    fn linux_peer_bootstrap_rejects_dynamic_elf_binaries() {
+        let mut elf = vec![0_u8; 64 + 56];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+
+        assert!(linux_binary_is_static(&elf).unwrap());
+        elf[64..68].copy_from_slice(&3_u32.to_le_bytes());
+        assert!(!linux_binary_is_static(&elf).unwrap());
+    }
 
     #[test]
     fn remote_install_makes_bootstrapped_binary_the_stable_cli() {
