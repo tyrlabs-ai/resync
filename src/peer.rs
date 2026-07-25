@@ -1,5 +1,5 @@
 use crate::config::ensure_project_config;
-use crate::credentials::{generate_device_identity, load_credential};
+use crate::credentials::{generate_device_identity, load_credential, remove_device_identity};
 use crate::daemon::daemon_rpc;
 use crate::git_state::current_branch;
 use crate::identity::{read_identity, same_project, write_identity};
@@ -380,6 +380,29 @@ pub struct AcceptOptions<'a> {
     pub device_name: &'a str,
 }
 
+fn enrollment_token<'a>(
+    enrollment: &'a Value,
+    existing_token: Option<&'a str>,
+) -> Result<(&'a str, bool)> {
+    if enrollment
+        .get("reused_device")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok((
+            existing_token.context("provider reused a device without an existing credential")?,
+            false,
+        ));
+    }
+    Ok((
+        enrollment
+            .get("token")
+            .and_then(Value::as_str)
+            .context("ticket enrollment returned no token")?,
+        true,
+    ))
+}
+
 fn peer_destination(
     explicit: Option<&Path>,
     managed_project_path: Option<&Path>,
@@ -400,6 +423,7 @@ fn peer_destination(
 
 pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
     let discovery = discover(Some(options.provider))?;
+    let existing_token = load_credential(&discovery.origin)?;
     let key = generate_device_identity(options.device_name)?;
     let endpoint = discovery
         .endpoints
@@ -407,17 +431,18 @@ pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
         .context("provider discovery is missing ticket redemption endpoint")?;
     let enrollment = provider_fetch(
         endpoint,
-        None,
+        existing_token.as_deref(),
         Method::POST,
         Some(&json!({
             "ticket": options.ticket, "device_name": options.device_name, "public_key": key.public_key
         })),
     )?;
-    store_provider_login(&discovery, &enrollment, &key)?;
-    let token = enrollment
-        .get("token")
-        .and_then(Value::as_str)
-        .context("ticket enrollment returned no token")?;
+    let (token, replaced_device) = enrollment_token(&enrollment, existing_token.as_deref())?;
+    if replaced_device {
+        store_provider_login(&discovery, &enrollment, &key)?;
+    } else {
+        remove_device_identity(Some(&key.public_key_path))?;
+    }
     let catalog = fetch_catalog(&crate::state::Config {
         server: Some(discovery.origin.clone()),
         token: Some(token.into()),
@@ -475,14 +500,26 @@ pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        linux_binary_is_static, peer_destination, remote_home_path, remote_install_script,
-        remote_target_with_ssh, ticket_endpoint,
+        enrollment_token, linux_binary_is_static, peer_destination, remote_home_path,
+        remote_install_script, remote_target_with_ssh, ticket_endpoint,
     };
     use crate::provider::Discovery;
+    use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    #[test]
+    fn repeated_peer_enrollment_keeps_the_existing_device_token() {
+        let enrollment = json!({
+            "device": { "id": "dev_existing" },
+            "reused_device": true
+        });
+        let (token, replaced) = enrollment_token(&enrollment, Some("existing-token")).unwrap();
+        assert_eq!(token, "existing-token");
+        assert!(!replaced);
+    }
 
     #[test]
     fn linux_peer_bootstrap_rejects_dynamic_elf_binaries() {

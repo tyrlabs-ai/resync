@@ -95,7 +95,7 @@ Non-secret provider configuration belongs under the user's configuration directo
 
 Implementations SHOULD prefer an operating-system keychain or configured external credential helper. A headless fallback MAY use files readable only by the operating-system user, but MUST describe that boundary honestly and MUST NOT claim that a key stored beside encrypted data adds protection. Environment credentials MAY be used without persistence in CI.
 
-Private device keys and long-lived account/device credentials MUST NOT be copied during peer synchronization. Only a one-time join ticket crosses the existing SSH channel. Future project encryption keys are separate data-plane material and may be wrapped to the new device public key only after enrollment authorization succeeds.
+Private device keys and long-lived account/device credentials MUST NOT be copied during peer synchronization. Only a one-time join ticket crosses the existing SSH channel. When the receiving machine already has a device credential for the same provider account, it SHOULD redeem the ticket as that authenticated device so the provider adds the project authorization without replacing the credential or losing prior projects. Future project encryption keys are separate data-plane material and may be wrapped to the device public key only after enrollment authorization succeeds.
 
 ## SSH peer bootstrap
 
