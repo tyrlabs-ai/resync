@@ -510,9 +510,11 @@ pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::linux_binary_is_static;
     use super::{
-        enrollment_token, linux_binary_is_static, peer_destination, remote_home_path,
-        remote_install_script, remote_target_with_ssh, ticket_endpoint,
+        enrollment_token, peer_destination, remote_home_path, remote_install_script,
+        remote_target_with_ssh, ticket_endpoint,
     };
     use crate::provider::Discovery;
     use serde_json::json;
