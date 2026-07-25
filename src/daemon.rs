@@ -11,9 +11,10 @@ use crate::transaction::{ReconcileResult, reconcile_workspace};
 use anyhow::{Context, Result, bail};
 use rand::Rng;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read as _, Write as _};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -107,6 +108,7 @@ impl LeaseGate {
 struct DaemonInner {
     paths: StatePaths,
     config: Config,
+    binary_id: String,
     catalog: Mutex<LocalCatalog>,
     gates: StdMutex<HashMap<String, Arc<LeaseGate>>>,
     background_reconciliations: StdMutex<HashSet<String>>,
@@ -135,6 +137,7 @@ impl ResyncDaemon {
             inner: Arc::new(DaemonInner {
                 paths,
                 config,
+                binary_id: executable_fingerprint()?,
                 catalog: Mutex::new(catalog),
                 gates: StdMutex::new(HashMap::new()),
                 background_reconciliations: StdMutex::new(HashSet::new()),
@@ -158,6 +161,7 @@ impl ResyncDaemon {
             inner: Arc::new(DaemonInner {
                 paths,
                 config,
+                binary_id: executable_fingerprint()?,
                 catalog: Mutex::new(catalog),
                 gates: StdMutex::new(HashMap::new()),
                 background_reconciliations: StdMutex::new(HashSet::new()),
@@ -571,7 +575,11 @@ impl ResyncDaemon {
 
     pub async fn handle(&self, request: Value) -> Result<Value> {
         match request.get("method").and_then(Value::as_str).unwrap_or("") {
-            "ping" => Ok(json!({ "protocol": PROTOCOL_VERSION, "pid": std::process::id() })),
+            "ping" => Ok(json!({
+                "protocol": PROTOCOL_VERSION,
+                "pid": std::process::id(),
+                "binaryId": self.inner.binary_id
+            })),
             "reload" => {
                 let mut loaded = load_catalog()?;
                 migrate_projects(&mut loaded.projects);
@@ -806,9 +814,64 @@ pub fn runtime() -> Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
+fn executable_fingerprint() -> Result<String> {
+    let executable = std::env::current_exe()?;
+    let mut file = File::open(&executable)
+        .with_context(|| format!("open current executable {}", executable.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn daemon_matches_client(ping: &Value, client_binary_id: &str) -> bool {
+    ping.get("binaryId").and_then(Value::as_str) == Some(client_binary_id)
+}
+
+fn terminate_stale_daemon(ping: &Value) -> Result<()> {
+    let pid = ping
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|value| libc::pid_t::try_from(value).ok())
+        .ok_or_else(|| anyhow::anyhow!("stale RepoSync daemon did not report a valid pid"))?;
+    if pid == libc::pid_t::try_from(std::process::id()).unwrap_or_default() {
+        bail!("refusing to terminate the current RepoSync process");
+    }
+    // SAFETY: pid came from the daemon that answered on this user's mode-0600
+    // Unix socket. SIGTERM asks that daemon to perform its normal cleanup.
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("terminate stale RepoSync daemon");
+        }
+    }
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        match crate::rpc::rpc(&json!({ "method": "ping" }), None) {
+            Err(_) => return Ok(()),
+            Ok(current) if current.get("pid").and_then(Value::as_u64) != Some(pid as u64) => {
+                return Ok(());
+            }
+            Ok(_) => {}
+        }
+    }
+    bail!("stale RepoSync daemon {pid} did not stop after SIGTERM")
+}
+
 pub fn daemon_rpc(request: &Value) -> Result<Value> {
-    if let Ok(result) = crate::rpc::rpc(request, None) {
-        return Ok(result);
+    let binary_id = executable_fingerprint()?;
+    if let Ok(ping) = crate::rpc::rpc(&json!({ "method": "ping" }), None) {
+        if daemon_matches_client(&ping, &binary_id) {
+            return crate::rpc::rpc(request, None);
+        }
+        terminate_stale_daemon(&ping)?;
     }
     let paths = state_paths();
     fs::create_dir_all(&paths.root)?;
@@ -841,8 +904,15 @@ pub fn daemon_rpc(request: &Value) -> Result<Value> {
     let mut last = None;
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(100));
-        match crate::rpc::rpc(request, None) {
-            Ok(value) => return Ok(value),
+        match crate::rpc::rpc(&json!({ "method": "ping" }), None) {
+            Ok(ping) if daemon_matches_client(&ping, &binary_id) => {
+                return crate::rpc::rpc(request, None);
+            }
+            Ok(_) => {
+                last = Some(anyhow::anyhow!(
+                    "another RepoSync daemon with a different binary is running"
+                ));
+            }
             Err(error) => last = Some(error),
         }
     }
@@ -870,10 +940,23 @@ pub fn daemon_rpc(request: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::LeaseGate;
+    use super::{LeaseGate, daemon_matches_client};
     use serde_json::json;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn stale_daemon_builds_are_not_reused() {
+        assert!(daemon_matches_client(
+            &json!({ "binaryId": "current", "pid": 42 }),
+            "current"
+        ));
+        assert!(!daemon_matches_client(
+            &json!({ "binaryId": "stale", "pid": 42 }),
+            "current"
+        ));
+        assert!(!daemon_matches_client(&json!({ "pid": 42 }), "current"));
+    }
 
     #[tokio::test]
     async fn exclusive_owners_are_serialized() {

@@ -87,7 +87,7 @@ The daemon listens on a mode-`0600` Unix socket and exchanges newline-delimited 
 
 A grant contains `lease_id`, `workspace_generation`, `branch_oid`, `reconciliation`, an optional path summary, and an optional model-visible message. A blocked response contains `state`, `model_message`, and `recovery_actions`.
 
-Release uses `releaseAccess` with the lease ID and outcome. Other V1 methods are `status`, `sync`, `publish`, and `ping`. IPC access is local authorization; repository canonicalization and subscription checks scope every request.
+Release uses `releaseAccess` with the lease ID and outcome. Other V1 methods are `status`, `sync`, `publish`, and `ping`. A successful `ping` reports the daemon PID and a SHA-256 `binaryId` for the running executable. A client whose own executable fingerprint differs MUST replace the stale per-user daemon before sending an operation that depends on current reconciliation behavior. IPC access is local authorization; repository canonicalization and subscription checks scope every request.
 
 ## Credential storage contract
 
@@ -101,4 +101,4 @@ Private device keys and long-lived account/device credentials MUST NOT be copied
 
 Running `resync <ssh-target>` inside an enrolled checkout means “enroll the peer in this project and converge it with the same hosted Git repository.” It is not folder mirroring.
 
-The initiating client obtains a join ticket, starts or bootstraps the open-source remote helper over SSH, and asks the helper to redeem the ticket. A target without an explicit path materializes into a deterministic user-local checkout directory keyed by project ID. Existing target paths are accepted only when their empty identity or exact `(service origin, project_id)` is compatible. An existing directory without Git metadata MAY be adopted only when its tracked files exactly match a commit reachable from the hosted project; untracked files are preserved and an unknown or modified snapshot fails closed. Different project IDs fail closed.
+The initiating client obtains a join ticket, starts or bootstraps the open-source remote helper over SSH, makes that helper the stable user-local CLI, and asks it to redeem the ticket. A target without an explicit path materializes into a deterministic user-local checkout directory keyed by project ID. Existing target paths are accepted only when their empty identity or exact `(service origin, project_id)` is compatible. An existing directory without Git metadata MAY be adopted only when its tracked files exactly match a commit reachable from the hosted project; untracked files are preserved and an unknown or modified snapshot fails closed. Different project IDs fail closed.

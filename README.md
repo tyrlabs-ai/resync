@@ -41,7 +41,7 @@ resync yolopods-t3-peer
 # equivalent to: resync peer sync yolopods-t3-peer
 ```
 
-The initiating machine creates a five-minute, one-time join ticket and bootstraps this open-source package over SSH when necessary. The peer generates its own key and credential, joins the same `(service, project_id)`, and receives a distinct checkout ID. Use `host:/path` or `--into /path` to select a remote destination; otherwise RepoSync uses its user-local checkout directory.
+The initiating machine creates a five-minute, one-time join ticket and bootstraps this open-source package over SSH when necessary. The bootstrapped binary becomes the peer's stable user-local `resync` command, and its executable fingerprint replaces any stale per-user daemon before enrollment continues. The peer generates its own key and credential, joins the same `(service, project_id)`, and receives a distinct checkout ID. Use `host:/path` or `--into /path` to select a remote destination; otherwise RepoSync uses its user-local checkout directory.
 
 Managed SSH environments can export `RESYNC_PEER_PROJECT_PATH` to make a bare
 `resync <ssh-target>` enroll their active project checkout. RepoSync also

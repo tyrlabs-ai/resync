@@ -50,6 +50,18 @@ fn remote_home_path(relative: &str) -> String {
     format!("\"$HOME\"/{}", shell_quote(relative))
 }
 
+fn remote_install_script(remote: &str) -> String {
+    format!(
+        "set -eu\nchmod 755 {}\nmv {} {}\nmkdir -p {}\nln -sfn {} {}\n",
+        remote_home_path(&format!("{remote}.tmp")),
+        remote_home_path(&format!("{remote}.tmp")),
+        remote_home_path(remote),
+        remote_home_path(".local/bin"),
+        remote_home_path(remote),
+        remote_home_path(".local/bin/resync")
+    )
+}
+
 fn remote_target_with_ssh(ssh: &Path, host: &str) -> Result<String> {
     let output = run(
         ssh,
@@ -155,15 +167,7 @@ fn install_remote_binary(host: &str) -> Result<String> {
         "ssh",
         [host, "sh", "-s"],
         RunOptions {
-            input: Some(
-                format!(
-                    "set -eu\nchmod 755 {}\nmv {} {}\n",
-                    remote_home_path(&format!("{remote}.tmp")),
-                    remote_home_path(&format!("{remote}.tmp")),
-                    remote_home_path(&remote)
-                )
-                .into_bytes(),
-            ),
+            input: Some(remote_install_script(&remote).into_bytes()),
             ..RunOptions::default()
         },
     )?;
@@ -414,12 +418,24 @@ pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{peer_destination, remote_home_path, remote_target_with_ssh, ticket_endpoint};
+    use super::{
+        peer_destination, remote_home_path, remote_install_script, remote_target_with_ssh,
+        ticket_endpoint,
+    };
     use crate::provider::Discovery;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    #[test]
+    fn remote_install_makes_bootstrapped_binary_the_stable_cli() {
+        let script = remote_install_script(".local/share/resync/bin/0.2.0/resync");
+        assert!(script.contains(
+            "ln -sfn \"$HOME\"/'.local/share/resync/bin/0.2.0/resync' \
+             \"$HOME\"/'.local/bin/resync'"
+        ));
+    }
 
     #[test]
     fn ticket_endpoint_substitutes_encoded_templates() {
