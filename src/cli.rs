@@ -707,11 +707,13 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
         .ok_or_else(|| anyhow::anyhow!("project {project_id} is not subscribed"))?;
     let codex_directory = project.local_path.join(".codex");
     let hooks_path = codex_directory.join("hooks.json");
-    let mut hooks: Value = if hooks_path.exists() {
+    let hooks_existed = hooks_path.exists();
+    let mut hooks: Value = if hooks_existed {
         serde_json::from_slice(&fs::read(&hooks_path)?)?
     } else {
         json!({ "description": "RepoSync cooperative workspace leases", "hooks": {} })
     };
+    let original_hooks = hooks.clone();
     let marker = format!("resync codex-hook {}", shell_quote(project_id));
     for event in ["PreToolUse", "PostToolUse"] {
         let groups = hooks
@@ -737,7 +739,9 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
         }] }));
     }
     fs::create_dir_all(&codex_directory)?;
-    write_json(&hooks_path, &hooks, 0o644)?;
+    if !hooks_existed || hooks != original_hooks {
+        write_json(&hooks_path, &hooks, 0o644)?;
+    }
     let skill_directory = project
         .local_path
         .join(".agents")
@@ -748,6 +752,10 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
     fs::create_dir_all(skill_metadata_path.parent().unwrap())?;
     fs::write(&skill_path, REPOSYNC_SKILL)?;
     fs::write(&skill_metadata_path, REPOSYNC_SKILL_OPENAI_METADATA)?;
+    ensure_local_excludes(
+        &project.local_path,
+        &["/.codex/hooks.json", "/.agents/skills/reposync/"],
+    )?;
     let hook_directory = PathBuf::from(
         git(
             &project.local_path,
@@ -775,6 +783,42 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
     Ok(
         json!({ "projectId": project_id, "codexHooks": hooks_path, "codexSkill": skill_path, "gitHook": hook_path, "requiresCodexTrustReview": true }),
     )
+}
+
+fn ensure_local_excludes(project_path: &Path, patterns: &[&str]) -> Result<()> {
+    let exclude_path = PathBuf::from(
+        git(
+            project_path,
+            [
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "info/exclude",
+            ],
+            RunOptions::default(),
+        )?
+        .stdout
+        .trim(),
+    );
+    let mut contents = fs::read_to_string(&exclude_path).unwrap_or_default();
+    let mut changed = false;
+    for pattern in patterns {
+        if !contents.lines().any(|line| line.trim() == *pattern) {
+            if !contents.is_empty() && !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            contents.push_str(pattern);
+            contents.push('\n');
+            changed = true;
+        }
+    }
+    if changed {
+        if let Some(parent) = exclude_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(exclude_path, contents)?;
+    }
+    Ok(())
 }
 
 fn safe_hook_part(value: Option<&str>) -> String {
