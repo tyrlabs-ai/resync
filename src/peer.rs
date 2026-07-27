@@ -6,7 +6,6 @@ use crate::identity::{read_identity, same_project, write_identity};
 use crate::process::{RunOptions, git, run};
 use crate::provider::{Discovery, discover, provider_fetch, store_provider_login};
 use crate::remote::{fetch_catalog, materialize_project, resolved_config};
-use crate::state::{LocalProject, load_catalog, state_paths, write_json};
 use anyhow::{Context, Result, bail};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -229,19 +228,6 @@ fn install_remote_binary(host: &str) -> Result<String> {
         },
     )?;
     Ok(remote_home_path(&remote))
-}
-
-fn persist_project(project: LocalProject, generation: Option<u64>) -> Result<()> {
-    let paths = state_paths();
-    let mut catalog = load_catalog()?;
-    catalog.projects.retain(|item| {
-        item.project_id != project.project_id && item.local_path != project.local_path
-    });
-    catalog.projects.push(project);
-    if let Some(generation) = generation {
-        catalog.catalog_generation = generation;
-    }
-    write_json(&paths.catalog, &catalog, 0o600)
 }
 
 pub fn peer_sync(
@@ -500,9 +486,8 @@ pub fn peer_accept(options: AcceptOptions<'_>) -> Result<Value> {
     local.service = identity.service.clone();
     local.checkout_id = identity.checkout_id.clone();
     ensure_project_config(&local.local_path)?;
-    persist_project(local.clone(), Some(catalog.catalog_generation))?;
+    crate::cli::register_project_with_daemon(&local, Some(catalog.catalog_generation))?;
     crate::cli::install_adapters(options.project_id)?;
-    daemon_rpc(&json!({ "method": "reload" }))?;
     Ok(
         json!({ "projectId": options.project_id, "service": discovery.origin, "checkoutId": identity.checkout_id, "localPath": local.local_path }),
     )

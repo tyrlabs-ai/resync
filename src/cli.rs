@@ -138,7 +138,7 @@ struct LoginArgs {
 enum ProjectCommand {
     #[command(about = "Create a new synchronization universe for this Git repository")]
     Init(ProjectCreateArgs),
-    #[command(about = "Join an authorized existing project with a distinct checkout ID")]
+    #[command(about = "Join an account project with a distinct checkout ID")]
     Join {
         project_id: String,
         #[arg(long)]
@@ -543,7 +543,7 @@ fn project_create(arguments: ProjectCreateArgs, fork: bool) -> Result<Value> {
             .find(|item| item.project_id == prior_project)
             .with_context(|| {
                 format!(
-                    "ACCESS_LOST: device membership for {prior_project} is missing; redeem a new join ticket from an authorized peer"
+                    "ACCESS_LOST: {prior_project} is not owned by the active device account; verify the provider login and device registration"
                 )
             })?;
         let existing = load_catalog()?
@@ -560,9 +560,8 @@ fn project_create(arguments: ProjectCreateArgs, fork: bool) -> Result<Value> {
         local.service = prior.service.clone();
         local.checkout_id = prior.checkout_id.clone();
         ensure_project_config(&root)?;
-        persist_project(local.clone(), Some(remote.catalog_generation))?;
+        register_project_with_daemon(&local, Some(remote.catalog_generation))?;
         install_adapters(prior_project)?;
-        daemon_rpc(&json!({ "method": "reload" }))?;
         let _ = daemon_rpc(&json!({ "method": "sync", "project_id": prior_project }))?;
         let _ = daemon_rpc(&json!({ "method": "publish", "project_id": prior_project }))?;
         let mut value = serde_json::to_value(local)?;
@@ -630,9 +629,8 @@ fn project_create(arguments: ProjectCreateArgs, fork: bool) -> Result<Value> {
     local.service = identity.service;
     local.checkout_id = identity.checkout_id;
     ensure_project_config(&root)?;
-    persist_project(local.clone(), None)?;
+    register_project_with_daemon(&local, None)?;
     install_adapters(&local.project_id)?;
-    daemon_rpc(&json!({ "method": "reload" }))?;
     fs::remove_file(&creation_path)?;
     if let Some(parent) = creation_path.parent() {
         fs::File::open(parent)?.sync_all()?;
@@ -654,10 +652,8 @@ fn project_join(project_id: &str, path: Option<&Path>, provider: Option<&str>) -
         .projects
         .iter()
         .find(|item| item.project_id == project_id)
-        .context("project is not in this device's catalog")?;
-    let destination = path
-        .map(Path::to_owned)
-        .unwrap_or(repository_root(&std::env::current_dir()?)?);
+        .context("project is not in the active device account's catalog")?;
+    let destination = join_destination(path, &std::env::current_dir()?)?;
     if destination.exists()
         && let Ok(existing) = read_identity(&destination)
         && let (Some(id), Some(service)) = (&existing.project_id, &existing.service)
@@ -672,23 +668,32 @@ fn project_join(project_id: &str, path: Option<&Path>, provider: Option<&str>) -
     local.service = identity.service;
     local.checkout_id = identity.checkout_id;
     ensure_project_config(&local.local_path)?;
-    persist_project(local.clone(), Some(remote.catalog_generation))?;
+    register_project_with_daemon(&local, Some(remote.catalog_generation))?;
     install_adapters(project_id)?;
-    daemon_rpc(&json!({ "method": "reload" }))?;
     Ok(serde_json::to_value(local)?)
 }
 
-fn persist_project(project: LocalProject, generation: Option<u64>) -> Result<()> {
-    let paths = state_paths();
-    let mut catalog = load_catalog()?;
-    catalog.projects.retain(|item| {
-        item.project_id != project.project_id && item.local_path != project.local_path
-    });
-    catalog.projects.push(project);
-    if let Some(value) = generation {
-        catalog.catalog_generation = value;
+fn join_destination(path: Option<&Path>, current_directory: &Path) -> Result<PathBuf> {
+    match path {
+        Some(path) => Ok(path.to_owned()),
+        None => repository_root(current_directory),
     }
-    write_json(&paths.catalog, &catalog, 0o600)
+}
+
+pub(crate) fn register_project_with_daemon(
+    project: &LocalProject,
+    generation: Option<u64>,
+) -> Result<()> {
+    ensure_daemon_supervision()?;
+    let mut request = json!({
+        "method": "registerProject",
+        "project": project
+    });
+    if let Some(generation) = generation {
+        request["catalog_generation"] = Value::from(generation);
+    }
+    daemon_rpc(&request)?;
+    Ok(())
 }
 
 fn unsubscribe(project_id: Option<&str>) -> Result<Value> {
@@ -904,6 +909,11 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
 }
 
 fn ensure_daemon_supervision() -> Result<&'static str> {
+    // An explicit state directory is an isolated CLI/test instance. It must not
+    // rewrite or start the user's global systemd service with this executable.
+    if std::env::var_os("RESYNC_STATE_DIR").is_some() {
+        return Ok("state-dir");
+    }
     #[cfg(target_os = "linux")]
     {
         let available = run_process(
@@ -1074,5 +1084,21 @@ fn absolute(path: &Path) -> PathBuf {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_destination;
+
+    #[test]
+    fn explicit_join_path_does_not_require_a_git_worktree() -> anyhow::Result<()> {
+        let outside_git = tempfile::tempdir()?;
+        let destination = outside_git.path().join("checkout");
+        assert_eq!(
+            join_destination(Some(&destination), outside_git.path())?,
+            destination
+        );
+        Ok(())
     }
 }

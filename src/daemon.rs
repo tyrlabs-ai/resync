@@ -1001,6 +1001,29 @@ impl ResyncDaemon {
                 "pid": std::process::id(),
                 "binaryId": self.inner.binary_id
             })),
+            "registerProject" => {
+                let project: LocalProject = serde_json::from_value(
+                    request
+                        .get("project")
+                        .cloned()
+                        .context("registerProject requires project")?,
+                )?;
+                let mut catalog = self.inner.catalog.lock().await;
+                catalog.projects.retain(|item| {
+                    item.project_id != project.project_id && item.local_path != project.local_path
+                });
+                catalog.projects.push(project.clone());
+                if let Some(generation) = request.get("catalog_generation").and_then(Value::as_u64)
+                {
+                    catalog.catalog_generation = catalog.catalog_generation.max(generation);
+                }
+                self.persist(&catalog).await?;
+                Ok(json!({
+                    "projectId": project.project_id,
+                    "registered": true,
+                    "catalogGeneration": catalog.catalog_generation
+                }))
+            }
             "reload" => {
                 let mut loaded = load_catalog()?;
                 migrate_projects(&mut loaded.projects);
@@ -1418,7 +1441,8 @@ pub fn daemon_rpc(request: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LeaseGate, daemon_matches_client};
+    use super::{LeaseGate, ResyncDaemon, daemon_matches_client};
+    use crate::state::{Config, LocalCatalog, LocalProject, StatePaths, read_json};
     use serde_json::json;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1464,5 +1488,53 @@ mod tests {
             .expect("second owner should acquire after release")
             .unwrap();
         gate.end_exclusive().await;
+    }
+
+    #[tokio::test]
+    async fn daemon_registration_atomically_persists_a_project() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("state");
+        let paths = StatePaths {
+            config: root.join("config.json"),
+            credentials: root.join("credentials.json"),
+            keys: root.join("keys"),
+            catalog: root.join("catalog.json"),
+            transactions: root.join("transactions"),
+            daemon_lock: root.join("daemon.lock"),
+            socket: root.join("daemon.sock"),
+            root,
+        };
+        let daemon = ResyncDaemon::from_parts(
+            paths.clone(),
+            Config::default(),
+            LocalCatalog {
+                catalog_generation: 3,
+                projects: Vec::new(),
+            },
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        )?;
+        let project: LocalProject = serde_json::from_value(json!({
+            "projectId": "prj_registered",
+            "localPath": temporary.path().join("checkout")
+        }))?;
+
+        daemon
+            .handle(json!({
+                "method": "registerProject",
+                "project": project,
+                "catalog_generation": 4
+            }))
+            .await?;
+
+        let persisted: LocalCatalog = read_json(&paths.catalog, LocalCatalog::default())?;
+        assert_eq!(persisted.catalog_generation, 4);
+        assert_eq!(persisted.projects.len(), 1);
+        assert_eq!(persisted.projects[0].project_id, "prj_registered");
+        assert_eq!(
+            daemon.project_snapshot("prj_registered").await?.project_id,
+            "prj_registered"
+        );
+        Ok(())
     }
 }

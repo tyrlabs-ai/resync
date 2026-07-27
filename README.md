@@ -32,7 +32,7 @@ resync auth --help
 resync project init -h
 ```
 
-An ordinary Git clone has no RepoSync identity. Run `resync project init` to give that clone an independent hosted project, `resync project join PROJECT_ID` to join an authorized existing project, or `resync project fork` to separate an enrolled checkout while preserving its Git history.
+An ordinary Git clone has no RepoSync identity. Run `resync project init` to give that clone an independent hosted project, `resync project join PROJECT_ID` to join any existing project owned by the registered device's account, or `resync project fork` to separate an enrolled checkout while preserving its Git history.
 
 To enroll another SSH machine in the current project:
 
@@ -41,7 +41,7 @@ resync yolopods-t3-peer
 # equivalent to: resync peer sync yolopods-t3-peer
 ```
 
-The initiating machine creates a five-minute, one-time join ticket and bootstraps this open-source package over SSH when necessary. The bootstrapped binary becomes the peer's stable user-local `resync` command, and its executable fingerprint replaces any stale per-user daemon before enrollment continues. The peer generates its own key and credential, joins the same `(service, project_id)`, and receives a distinct checkout ID. Use `host:/path` or `--into /path` to select a remote destination; otherwise RepoSync uses its user-local checkout directory.
+For an unregistered target, the initiating machine creates a five-minute, one-time join ticket and bootstraps this open-source package over SSH when necessary. The bootstrapped binary becomes the peer's stable user-local `resync` command, and its executable fingerprint replaces any stale per-user daemon before enrollment continues. The peer generates its own key and credential, joins the same `(service, project_id)`, and receives a distinct checkout ID. Use `host:/path` or `--into /path` to select a remote destination; otherwise RepoSync uses its user-local checkout directory. A target already registered to the same provider account uses `resync project join PROJECT_ID` locally and needs neither SSH nor a ticket.
 
 Managed SSH environments can export `RESYNC_PEER_PROJECT_PATH` to make a bare
 `resync <ssh-target>` enroll their active project checkout. RepoSync also

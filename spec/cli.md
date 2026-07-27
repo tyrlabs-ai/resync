@@ -62,6 +62,12 @@ resync yolopods-t3-peer
 resync peer sync builder:/work/api
 ```
 
+`project join` discovers any project owned by the active device's provider
+account. It is the normal way to materialize an account project on another
+already-registered device and requires neither an invitation nor SSH. `peer
+sync` is reserved for enrolling a target that has no device identity for the
+account.
+
 A peer bootstrap environment MAY export `RESYNC_PEER_PROJECT_PATH` to select
 its active checkout when the caller does not pass an explicit path. The
 Yolopods compatibility variable `YOLOPODS_PROJECT_PATH` has the same behavior.
