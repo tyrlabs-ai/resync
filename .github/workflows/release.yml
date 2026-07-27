@@ -61,7 +61,7 @@ jobs:
           path: resync-${{ matrix.target }}
           if-no-files-found: error
 
-  publish:
+  release:
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -69,7 +69,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@v4
         with:
           pattern: resync-*
@@ -93,19 +92,3 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
           fi
-      - name: Assemble npm platform packages
-        run: |
-          mkdir -p npm/linux-x64/bin npm/linux-arm64/bin npm/darwin-x64/bin npm/darwin-arm64/bin
-          cp dist/resync-x86_64-unknown-linux-gnu npm/linux-x64/bin/resync
-          cp dist/resync-aarch64-unknown-linux-gnu npm/linux-arm64/bin/resync
-          cp dist/resync-x86_64-apple-darwin npm/darwin-x64/bin/resync
-          cp dist/resync-aarch64-apple-darwin npm/darwin-arm64/bin/resync
-          chmod 755 npm/*/bin/resync
-      - name: Publish npm packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          for package in npm/linux-x64 npm/linux-arm64 npm/darwin-x64 npm/darwin-arm64; do
-            npm publish "./$package" --access public
-          done
-          npm publish --access public
