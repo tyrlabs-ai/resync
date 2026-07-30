@@ -151,8 +151,8 @@ canonicalization and subscription checks scope every request.
 
 ## Credential storage contract
 
-Non-secret provider configuration belongs under the user's configuration
-directory. Device private keys and bearer credentials belong in an
+Provider configuration belongs under the user's configuration directory.
+Device private keys and bearer credentials belong in an
 interchangeable credential store keyed by canonical service origin and device
 ID. Joining a project already owned by the account uses that same
 provider/device identity directly; it never rotates the active provider
@@ -160,7 +160,7 @@ credential as a side effect.
 
 Implementations SHOULD prefer an operating-system keychain or configured external credential helper. A headless fallback MAY use files readable only by the operating-system user, but MUST describe that boundary honestly and MUST NOT claim that a key stored beside encrypted data adds protection. Environment credentials MAY be used without persistence in CI.
 
-Private device keys and long-lived account/device credentials MUST NOT be copied during peer synchronization. A one-time join ticket crosses the existing SSH channel only when the receiver is not registered to the provider account. A receiver already registered to the account obtains the project from its catalog with `project join`; no ticket or SSH-mediated authorization is required. Future project encryption keys are separate data-plane material and may be wrapped to the device public key only after enrollment authorization succeeds.
+Private device keys and long-lived account/device credentials MUST NOT be copied during peer synchronization. A one-time join ticket crosses the existing SSH channel only when the receiver is not registered to the provider account. A receiver already registered to the account obtains the project from its catalog with `project join`; no ticket or SSH-mediated authorization is required.
 
 ## SSH peer bootstrap
 

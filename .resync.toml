@@ -1,10 +1,7 @@
 version = 1
 
-[sync]
-poll_interval = "10s"
-preserve_index = true
-conflict_behavior = "pause-writes"
-
-[publish]
-automatic = true
-max_retries = 5
+# Run commands against the exact commit before RepoSync publishes it. Keep this
+# file committed so every checkout applies the same publication policy.
+#
+# [[validation]]
+# command = ["cargo", "test", "--locked"]

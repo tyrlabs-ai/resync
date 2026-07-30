@@ -60,12 +60,12 @@ fn git_conflict_leaves_workspace_unchanged() -> anyhow::Result<()> {
 #[test]
 fn incoming_tracked_path_cannot_overwrite_untracked_file() -> anyhow::Result<()> {
     let fixture = fixture()?;
-    fs::write(fixture.local.join("secret"), "local secret\n")?;
-    fs::write(fixture.seed.join("secret"), "remote tracked\n")?;
-    git(&fixture.seed, ["add", "secret"], RunOptions::default())?;
+    fs::write(fixture.local.join("local-only"), "local contents\n")?;
+    fs::write(fixture.seed.join("local-only"), "remote tracked\n")?;
+    git(&fixture.seed, ["add", "local-only"], RunOptions::default())?;
     git(
         &fixture.seed,
-        ["commit", "-m", "track secret"],
+        ["commit", "-m", "track colliding path"],
         RunOptions::default(),
     )?;
     git(
@@ -82,10 +82,10 @@ fn incoming_tracked_path_cannot_overwrite_untracked_file() -> anyhow::Result<()>
         Some(&fixture.root.path().join("transactions")),
     )?;
     assert_eq!(result.outcome, "conflict");
-    assert_eq!(result.paths, vec!["secret"]);
+    assert_eq!(result.paths, vec!["local-only"]);
     assert_eq!(
-        fs::read_to_string(fixture.local.join("secret"))?,
-        "local secret\n"
+        fs::read_to_string(fixture.local.join("local-only"))?,
+        "local contents\n"
     );
     Ok(())
 }

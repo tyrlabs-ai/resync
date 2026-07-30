@@ -6,7 +6,7 @@ This repository is the public half of the system. It contains the normative V1 s
 
 ## Status
 
-This is a working V1 engineering preview. The transaction engine preserves ordinary tracked files, executable modes, symlinks, staged versus unstaged state, and non-colliding untracked files. It intentionally rejects force-pushed history and untracked-path collisions. Submodules, Git LFS, sparse checkout, merge-heavy unpublished history, intent-to-add entries, arbitrary writers, FUSE, and secret synchronization are outside the current guarantee.
+This is a working V1 engineering preview. The transaction engine preserves ordinary tracked files, executable modes, symlinks, staged versus unstaged state, and non-colliding untracked files. It intentionally rejects force-pushed history and untracked-path collisions. Submodules, Git LFS, sparse checkout, merge-heavy unpublished history, intent-to-add entries, arbitrary writers, and FUSE are outside the current guarantee.
 
 ## Quick start
 
@@ -33,6 +33,29 @@ resync project init -h
 ```
 
 An ordinary Git clone has no RepoSync identity. Run `resync project init` to give that clone an independent hosted project, `resync project join PROJECT_ID` to join any existing project owned by the registered device's account, or `resync project fork` to separate an enrolled checkout while preserving its Git history.
+
+## Repository policy
+
+Enrollment creates `.resync.toml` as shared repository policy. Commit this file
+so every enrolled checkout validates publications consistently. It does not
+store provider credentials, checkout identity, or machine-local paths.
+
+Each `[[validation]]` entry defines one command as an argument array:
+
+```toml
+version = 1
+
+[[validation]]
+command = ["cargo", "fmt", "--check"]
+
+[[validation]]
+command = ["cargo", "test", "--locked"]
+```
+
+Immediately before pushing a commit, RepoSync checks out that exact commit in a
+temporary detached worktree and runs the commands in declaration order. A
+failed command blocks that publication attempt and leaves it queued for retry.
+An absent validation list permits publication without running a command.
 
 To enroll another SSH machine in the current project:
 

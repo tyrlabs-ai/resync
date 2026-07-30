@@ -5,14 +5,11 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_PROJECT_CONFIG: &str = r#"version = 1
 
-[sync]
-poll_interval = "10s"
-preserve_index = true
-conflict_behavior = "pause-writes"
-
-[publish]
-automatic = true
-max_retries = 5
+# Run commands against the exact commit before RepoSync publishes it. Keep this
+# file committed so every checkout applies the same publication policy.
+#
+# [[validation]]
+# command = ["cargo", "test", "--locked"]
 "#;
 
 pub fn ensure_project_config(project_path: &Path) -> Result<PathBuf> {
@@ -54,4 +51,47 @@ pub fn read_project_config(project_path: &Path) -> Result<ProjectConfig> {
             .filter(|value| !value.is_empty())
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_PROJECT_CONFIG, ProjectDocument, read_project_config};
+    use std::fs;
+
+    #[test]
+    fn generated_policy_is_valid_and_has_no_commands() -> anyhow::Result<()> {
+        assert_eq!(DEFAULT_PROJECT_CONFIG, include_str!("../.resync.toml"));
+        let document: ProjectDocument = toml::from_str(DEFAULT_PROJECT_CONFIG)?;
+        assert!(document.validation.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn reads_validation_commands_in_declaration_order() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join(".resync.toml"),
+            r#"version = 1
+
+[[validation]]
+command = ["cargo", "fmt", "--check"]
+
+[[validation]]
+command = []
+
+[[validation]]
+command = ["cargo", "test", "--locked"]
+"#,
+        )?;
+
+        let policy = read_project_config(directory.path())?;
+        assert_eq!(
+            policy.validations,
+            vec![
+                vec!["cargo", "fmt", "--check"],
+                vec!["cargo", "test", "--locked"],
+            ]
+        );
+        Ok(())
+    }
 }
