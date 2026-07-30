@@ -54,12 +54,9 @@ fn version_and_help_are_available() {
 }
 
 #[test]
-fn npm_install_runs_catalog_wide_adapter_repair() -> anyhow::Result<()> {
+fn npm_install_has_no_lifecycle_scripts() -> anyhow::Result<()> {
     let manifest: serde_json::Value = serde_json::from_str(include_str!("../package.json"))?;
-    assert_eq!(
-        manifest["scripts"]["postinstall"],
-        "node ./bin/resync.js install-adapters"
-    );
+    assert!(manifest.get("scripts").is_none());
     Ok(())
 }
 

@@ -840,7 +840,7 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
     Ok(result)
 }
 
-fn install_project_adapters(project: &LocalProject) -> Result<Value> {
+pub(crate) fn install_project_adapters(project: &LocalProject) -> Result<Value> {
     let project_id = &project.project_id;
     let codex_directory = project.local_path.join(".codex");
     let hooks_path = codex_directory.join("hooks.json");

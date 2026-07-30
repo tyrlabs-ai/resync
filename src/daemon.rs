@@ -1297,6 +1297,13 @@ pub async fn run_daemon(poll_interval: Duration) -> Result<()> {
     let daemon = ResyncDaemon::load(None, poll_interval, Duration::from_secs(3600))?;
     let paths = daemon.inner.paths.clone();
     acquire_process_lock(&paths)?;
+    let projects = daemon.inner.catalog.lock().await.projects.clone();
+    match current_adapter_build_id(&daemon.inner.binary_id)
+        .and_then(|build_id| repair_adapters_for_build(&paths, &projects, &build_id))
+    {
+        Ok(_) => {}
+        Err(error) => eprintln!("daemon adapter repair failed: {error:#}"),
+    }
     if paths.socket.exists() {
         fs::remove_file(&paths.socket)?;
     }
@@ -1358,6 +1365,48 @@ fn executable_fingerprint() -> Result<String> {
         digest.update(&buffer[..count]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn current_adapter_build_id(binary_id: &str) -> Result<String> {
+    Ok(format!(
+        "{}:{binary_id}:{}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::current_exe()?.display()
+    ))
+}
+
+fn repair_adapters_for_build(
+    paths: &StatePaths,
+    projects: &[LocalProject],
+    build_id: &str,
+) -> Result<bool> {
+    let marker_path = paths.root.join("adapter-build.json");
+    let installed: Value = read_json(&marker_path, Value::Null).unwrap_or(Value::Null);
+    if installed.get("buildId").and_then(Value::as_str) == Some(build_id) {
+        return Ok(false);
+    }
+
+    let failures = projects
+        .iter()
+        .filter_map(|project| {
+            crate::cli::install_project_adapters(project)
+                .err()
+                .map(|error| format!("{}: {error:#}", project.project_id))
+        })
+        .collect::<Vec<_>>();
+    if !failures.is_empty() {
+        bail!(
+            "could not refresh every managed checkout: {}",
+            failures.join("; ")
+        );
+    }
+
+    write_json(
+        &marker_path,
+        &json!({ "buildId": build_id, "version": env!("CARGO_PKG_VERSION") }),
+        0o600,
+    )?;
+    Ok(true)
 }
 
 fn daemon_matches_client(ping: &Value, client_binary_id: &str) -> bool {
@@ -1470,11 +1519,74 @@ pub fn daemon_rpc(request: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LeaseGate, ResyncDaemon, daemon_matches_client};
+    use super::{LeaseGate, ResyncDaemon, daemon_matches_client, repair_adapters_for_build};
     use crate::state::{Config, LocalCatalog, LocalProject, StatePaths, read_json};
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn new_daemon_build_repairs_adapters_once() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("project");
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(&repository)
+            .status()?;
+        anyhow::ensure!(status.success(), "could not initialize test repository");
+        let root = temporary.path().join("state");
+        let paths = StatePaths {
+            config: root.join("config.json"),
+            credentials: root.join("credentials.json"),
+            keys: root.join("keys"),
+            catalog: root.join("catalog.json"),
+            transactions: root.join("transactions"),
+            daemon_lock: root.join("daemon.lock"),
+            socket: root.join("daemon.sock"),
+            root,
+        };
+        let project = LocalProject {
+            project_id: "prj_adapter_upgrade".into(),
+            local_path: repository.clone(),
+            remote_url: String::new(),
+            remote_name: "resync".into(),
+            default_branch: "main".into(),
+            server_generation: 1,
+            advertised_heads: BTreeMap::new(),
+            last_applied_heads: BTreeMap::new(),
+            active_branch: Some("main".into()),
+            workspace_generation: 1,
+            state: "CURRENT".into(),
+            durability: "REMOTELY_DURABLE".into(),
+            conflict: None,
+            last_error: None,
+            service: None,
+            checkout_id: None,
+            extra: BTreeMap::new(),
+        };
+        let hooks = repository.join(".codex/hooks.json");
+
+        assert!(repair_adapters_for_build(
+            &paths,
+            std::slice::from_ref(&project),
+            "build-one"
+        )?);
+        assert!(fs::read_to_string(&hooks)?.contains("codex-hook"));
+
+        fs::write(&hooks, "{}\n")?;
+        assert!(!repair_adapters_for_build(
+            &paths,
+            std::slice::from_ref(&project),
+            "build-one"
+        )?);
+        assert_eq!(fs::read_to_string(&hooks)?, "{}\n");
+
+        assert!(repair_adapters_for_build(&paths, &[project], "build-two")?);
+        assert!(fs::read_to_string(hooks)?.contains("codex-hook"));
+        Ok(())
+    }
 
     #[test]
     fn stale_daemon_builds_are_not_reused() {

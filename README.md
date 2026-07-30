@@ -19,16 +19,18 @@ cd /absolute/path/to/checkout
 resync init --name my-project
 ```
 
-Installing or upgrading the npm package automatically runs `resync
-install-adapters`, refreshing lifecycle hooks and the bundled skill across all
-locally managed checkouts before the installation completes.
-
 Initialization installs the project-local RepoSync skill and Git/Codex adapters,
 then starts the per-user daemon automatically. The same is true for `join`,
 `fork`, and SSH peer enrollment. `resync install-adapters` repairs every
 locally managed checkout in one pass; pass an optional project ID to limit the
 repair to one checkout. `install-adapters` and `daemon` are repair and
 diagnostic commands, not normal setup steps.
+
+The daemon fingerprints its executable. Before a newly installed daemon build
+accepts requests, it refreshes lifecycle hooks and the bundled skill across all
+locally managed checkouts, then records that build as repaired. Restarts of the
+same build do not repeat the work. A failed repair is reported in the daemon log
+without preventing the daemon from starting and is retried on its next restart.
 
 Every command level supports both help spellings and lists its direct commands and options:
 
