@@ -84,6 +84,28 @@ fn install_adapters_without_project_repairs_every_local_checkout() -> anyhow::Re
         },
         0o600,
     )?;
+    write_json(
+        &first.join(".codex/hooks.json"),
+        &serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "*", "hooks": [{
+                        "type": "command",
+                        "command": "'/obsolete/resync' codex-hook 'prj_first'"
+                    }] },
+                    { "matcher": "Bash", "hooks": [{
+                        "type": "command",
+                        "command": "echo unrelated"
+                    }] }
+                ],
+                "PostToolUse": [{ "matcher": "*", "hooks": [{
+                    "type": "command",
+                    "command": "'/obsolete/resync' codex-hook 'prj_first'"
+                }] }]
+            }
+        }),
+        0o644,
+    )?;
 
     let assertion = Command::cargo_bin("resync")
         .unwrap()
@@ -100,11 +122,29 @@ fn install_adapters_without_project_repairs_every_local_checkout() -> anyhow::Re
         let hooks = fs::read_to_string(repository.join(".codex/hooks.json"))?;
         let hook_configuration: serde_json::Value = serde_json::from_str(&hooks)?;
         for event in ["PreToolUse", "PostToolUse"] {
-            let command = hook_configuration["hooks"][event][0]["hooks"][0]["command"]
-                .as_str()
-                .expect("generated RepoSync hook command");
+            let groups = hook_configuration["hooks"][event]
+                .as_array()
+                .expect("hook groups");
+            let generated = groups
+                .iter()
+                .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
+                .filter_map(|hook| hook["command"].as_str())
+                .filter(|command| command.ends_with(&format!(" codex-hook '{project_id}'")))
+                .collect::<Vec<_>>();
+            assert_eq!(generated.len(), 1, "one current RepoSync hook per event");
+            let command = generated[0];
             assert_ne!(command, format!("resync codex-hook '{project_id}'"));
             assert!(command.ends_with(&format!(" codex-hook '{project_id}'")));
+            assert!(!command.contains("/obsolete/resync"));
+        }
+        if project_id == "prj_first" {
+            assert_eq!(
+                hook_configuration["hooks"]["PreToolUse"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(2),
+                "unrelated hooks are preserved while the stale RepoSync hook is replaced"
+            );
         }
         assert!(
             repository

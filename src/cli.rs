@@ -852,11 +852,11 @@ pub(crate) fn install_project_adapters(project: &LocalProject) -> Result<Value> 
     };
     let original_hooks = hooks.clone();
     let executable = std::env::current_exe()?;
-    let legacy_marker = format!("resync codex-hook {}", shell_quote(project_id));
+    let hook_suffix = format!(" codex-hook {}", shell_quote(project_id));
+    let legacy_marker = format!("resync{hook_suffix}");
     let marker = format!(
-        "{} codex-hook {}",
+        "{}{hook_suffix}",
         shell_quote(&executable.to_string_lossy()),
-        shell_quote(project_id)
     );
     for event in ["PreToolUse", "PostToolUse"] {
         let groups = hooks
@@ -874,7 +874,9 @@ pub(crate) fn install_project_adapters(project: &LocalProject) -> Result<Value> 
                     items.iter().any(|item| {
                         item.get("command")
                             .and_then(Value::as_str)
-                            .is_some_and(|command| command == marker || command == legacy_marker)
+                            .is_some_and(|command| {
+                                command == legacy_marker || command.ends_with(&hook_suffix)
+                            })
                     })
                 })
         });
