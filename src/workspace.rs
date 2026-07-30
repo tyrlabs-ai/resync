@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 pub const WORKSPACE_MANIFEST_NAME: &str = ".resync-workspace.toml";
@@ -61,16 +62,15 @@ pub fn load_workspace(manifest_path: &Path) -> Result<Workspace> {
     let catalog_projects = catalog
         .projects
         .iter()
-        .map(|project| {
-            Ok((
-                fs::canonicalize(&project.local_path).with_context(|| {
-                    format!(
-                        "resolve subscribed project {}",
-                        project.local_path.display()
-                    )
-                })?,
-                project,
-            ))
+        .filter_map(|project| match fs::canonicalize(&project.local_path) {
+            Ok(path) => Some(Ok((path, project))),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => Some(Err(error).with_context(|| {
+                format!(
+                    "resolve subscribed project {}",
+                    project.local_path.display()
+                )
+            })),
         })
         .collect::<Result<Vec<_>>>()?;
     let mut seen_paths = BTreeSet::new();

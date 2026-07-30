@@ -180,6 +180,7 @@ fn workspace_install_hooks_writes_one_parent_dispatcher_for_explicit_projects() 
             projects: vec![
                 local_project("prj_first", first.clone()),
                 local_project("prj_second", second.clone()),
+                local_project("prj_stale", root.path().join("deleted-checkout")),
             ],
         },
         0o600,
