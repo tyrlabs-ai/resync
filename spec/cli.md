@@ -37,7 +37,7 @@ peer
 
 daemon
 doctor
-install-adapters <project>           # repair/reinstall; enrollment does this automatically
+install-adapters [PROJECT_ID]        # repair all local projects, or one selected project
 ```
 
 Compatibility aliases from the engineering preview MAY remain, but grouped commands are canonical. A non-command first positional value is treated as an SSH target only while inside an enrolled Git checkout; unknown command-like values outside that context produce help and an error.

@@ -16,7 +16,7 @@ Use RepoSync to propagate committed Git history between cooperating checkouts wh
    - Run `resync init --name <name>` for a new synchronization universe, even when another repository has identical Git history.
    - Run `resync join <project-id>` only when this checkout should share an existing provider and project ID. Each joined checkout receives its own checkout ID and device key.
    - Run `resync fork --name <name>` when an enrolled checkout should retain its Git history but become an independent RepoSync project.
-5. Let enrollment create `.resync.toml`, install the project-local RepoSync skill plus Codex and Git lifecycle hooks, and start or reconnect the per-user daemon. Commit `.resync.toml` so every checkout uses the same publication validations. Do not run `install-adapters` or `daemon` during normal setup; those are repair and diagnostic commands.
+5. Let enrollment create `.resync.toml`, install the project-local RepoSync skill plus Codex and Git lifecycle hooks, and start or reconnect the per-user daemon. Commit `.resync.toml` so every checkout uses the same publication validations. Do not run `install-adapters` or `daemon` during normal setup; those are repair and diagnostic commands. When adapter repair is required, `resync install-adapters` repairs every locally managed checkout in one pass, while an optional project ID limits it to one checkout.
 6. Review and trust newly installed project hooks, then verify setup with `resync doctor` and `resync status`.
 
 Use `resync <ssh-target>` to enroll another SSH machine into the same project through a one-time ticket. Use `host:/path` or `--into <path>` when the remote checkout location must be explicit.

@@ -21,7 +21,9 @@ resync init --name my-project
 
 Initialization installs the project-local RepoSync skill and Git/Codex adapters,
 then starts the per-user daemon automatically. The same is true for `join`,
-`fork`, and SSH peer enrollment. `install-adapters` and `daemon` are repair and
+`fork`, and SSH peer enrollment. `resync install-adapters` repairs every
+locally managed checkout in one pass; pass an optional project ID to limit the
+repair to one checkout. `install-adapters` and `daemon` are repair and
 diagnostic commands, not normal setup steps.
 
 Every command level supports both help spellings and lists its direct commands and options:
@@ -90,7 +92,7 @@ reconciled immediately in the background. If a participating tool call is
 active, installation waits for its lease to end and completes before another
 call is admitted.
 
-Enrollment automatically installs the bundled RepoSync skill at `.agents/skills/reposync`, merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json`, and installs a chainable, signal-only Git `post-commit` hook. `install-adapters` remains available as a repair command. A hook starts the daemon if necessary, so a commit notification is not lost merely because no daemon process was already running. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. The pre-tool hook coordinates an activity lease when RepoSync is available and otherwise lets the tool continue with a warning; the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
+Enrollment automatically installs the bundled RepoSync skill at `.agents/skills/reposync`, merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json`, and installs a chainable, signal-only Git `post-commit` hook. `resync install-adapters` remains available as a catalog-wide repair command, with an optional project ID for a single-checkout repair. A hook starts the daemon if necessary, so a commit notification is not lost merely because no daemon process was already running. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. The pre-tool hook coordinates an activity lease when RepoSync is available and otherwise lets the tool continue with a warning; the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
 
 ## Correctness boundary
 

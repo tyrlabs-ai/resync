@@ -79,9 +79,12 @@ enum Command {
     Doctor,
     #[command(
         name = "install-adapters",
-        about = "Repair or reinstall lifecycle adapters"
+        about = "Repair lifecycle adapters for every local project or one selected project"
     )]
-    InstallAdapters { project_id: String },
+    InstallAdapters {
+        #[arg(value_name = "PROJECT_ID")]
+        project_id: Option<String>,
+    },
     #[command(about = "Acquire one cooperative tool-call lease")]
     Acquire {
         project_id: String,
@@ -342,7 +345,9 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             Ok(None)
         }
         Command::Doctor => Ok(Some(doctor())),
-        Command::InstallAdapters { project_id } => Ok(Some(install_adapters(&project_id)?)),
+        Command::InstallAdapters { project_id } => {
+            Ok(Some(install_adapters_command(project_id.as_deref())?))
+        }
         Command::Acquire {
             project_id,
             session_id,
@@ -802,6 +807,27 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn install_adapters_command(project_id: Option<&str>) -> Result<Value> {
+    if let Some(project_id) = project_id {
+        return install_adapters(project_id);
+    }
+    let catalog = load_catalog()?;
+    let mut projects = Vec::with_capacity(catalog.projects.len());
+    for project in &catalog.projects {
+        projects.push(
+            install_project_adapters(project)
+                .with_context(|| format!("install adapters for {}", project.project_id))?,
+        );
+    }
+    let supervision = ensure_daemon_supervision()?;
+    Ok(json!({
+        "projectCount": projects.len(),
+        "projects": projects,
+        "daemonSupervision": supervision,
+        "requiresCodexTrustReview": !catalog.projects.is_empty()
+    }))
+}
+
 pub fn install_adapters(project_id: &str) -> Result<Value> {
     let catalog = load_catalog()?;
     let project = catalog
@@ -809,6 +835,13 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
         .iter()
         .find(|item| item.project_id == project_id)
         .ok_or_else(|| anyhow::anyhow!("project {project_id} is not subscribed"))?;
+    let mut result = install_project_adapters(project)?;
+    result["daemonSupervision"] = Value::String(ensure_daemon_supervision()?.into());
+    Ok(result)
+}
+
+fn install_project_adapters(project: &LocalProject) -> Result<Value> {
+    let project_id = &project.project_id;
     let codex_directory = project.local_path.join(".codex");
     let hooks_path = codex_directory.join("hooks.json");
     let hooks_existed = hooks_path.exists();
@@ -899,11 +932,9 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
     fs::write(&checkout_hook, checkout_script)?;
     #[cfg(unix)]
     fs::set_permissions(&checkout_hook, fs::Permissions::from_mode(0o755))?;
-    let supervision = ensure_daemon_supervision()?;
     Ok(
         json!({ "projectId": project_id, "codexHooks": hooks_path, "codexSkill": skill_path,
             "gitHooks": { "postCommit": hook_path, "postCheckout": checkout_hook },
-            "daemonSupervision": supervision,
             "requiresCodexTrustReview": true }),
     )
 }
