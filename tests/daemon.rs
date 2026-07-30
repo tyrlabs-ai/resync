@@ -70,13 +70,8 @@ fn failed_automatic_reconciliation_grants_access_until_explicit_sync() -> anyhow
                 .await?;
             assert_eq!(access["granted"], true);
             assert_eq!(access["reconciliation_mode"], true);
+            assert_eq!(access["lease_id"], serde_json::Value::Null);
             assert_eq!(fs::read_to_string(fixture.local.join("file"))?, "local\n");
-            daemon
-                .handle(serde_json::json!({
-                    "method": "releaseAccess",
-                    "lease_id": access["lease_id"]
-                }))
-                .await?;
         }
         assert_eq!(fs::read_dir(&paths.transactions)?.count(), 1);
 
@@ -205,7 +200,7 @@ fn idle_reconciliation_applies_only_current_branch() -> anyhow::Result<()> {
 }
 
 #[test]
-fn current_reconciliation_clears_stale_conflict() -> anyhow::Result<()> {
+fn conflicted_access_is_unleased_and_sync_clears_stale_conflict() -> anyhow::Result<()> {
     let fixture = fixture()?;
     let head = rev(&fixture.local, "HEAD")?;
     let project = LocalProject {
@@ -264,13 +259,7 @@ fn current_reconciliation_clears_stale_conflict() -> anyhow::Result<()> {
             .await?;
         assert_eq!(access["granted"], true);
         assert_eq!(access["reconciliation_mode"], true);
-        let lease = access["lease_id"].as_str().unwrap();
-        daemon
-            .handle(serde_json::json!({
-                "method": "releaseAccess",
-                "lease_id": lease
-            }))
-            .await?;
+        assert_eq!(access["lease_id"], serde_json::Value::Null);
         assert_eq!(
             daemon.project_snapshot("prj_stale_conflict").await?.state,
             "CONFLICTED"

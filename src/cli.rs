@@ -851,7 +851,13 @@ fn install_project_adapters(project: &LocalProject) -> Result<Value> {
         json!({ "description": "RepoSync cooperative workspace leases", "hooks": {} })
     };
     let original_hooks = hooks.clone();
-    let marker = format!("resync codex-hook {}", shell_quote(project_id));
+    let executable = std::env::current_exe()?;
+    let legacy_marker = format!("resync codex-hook {}", shell_quote(project_id));
+    let marker = format!(
+        "{} codex-hook {}",
+        shell_quote(&executable.to_string_lossy()),
+        shell_quote(project_id)
+    );
     for event in ["PreToolUse", "PostToolUse"] {
         let groups = hooks
             .pointer_mut(&format!("/hooks/{event}"))
@@ -865,9 +871,11 @@ fn install_project_adapters(project: &LocalProject) -> Result<Value> {
                 .get("hooks")
                 .and_then(Value::as_array)
                 .is_some_and(|items| {
-                    items
-                        .iter()
-                        .any(|item| item.get("command").and_then(Value::as_str) == Some(&marker))
+                    items.iter().any(|item| {
+                        item.get("command")
+                            .and_then(Value::as_str)
+                            .is_some_and(|command| command == marker || command == legacy_marker)
+                    })
                 })
         });
         groups.push(json!({ "matcher": "*", "hooks": [{
@@ -908,7 +916,6 @@ fn install_project_adapters(project: &LocalProject) -> Result<Value> {
     if hook_path.exists() && !fs::read_to_string(&hook_path)?.contains("# RepoSync dispatcher") {
         fs::rename(&hook_path, &previous)?;
     }
-    let executable = std::env::current_exe()?;
     let script = format!(
         "#!/bin/sh\n# RepoSync dispatcher\nset -u\n[ ! -x \"$0.pre-resync\" ] || \"$0.pre-resync\" \"$@\"\ncommit=\"$(git rev-parse HEAD 2>/dev/null)\" || exit 0\nbranch=\"$(git symbolic-ref --short HEAD 2>/dev/null)\" || exit 0\n{} report-commit {} \"$commit\" \"$branch\" >/dev/null || echo \"RepoSync could not schedule automatic publication\" >&2\n",
         shell_quote(&executable.to_string_lossy()),
@@ -1059,13 +1066,61 @@ fn is_project_sync_command(input: &Value) -> bool {
     let Some(command) = hook_command(input) else {
         return false;
     };
-    let words = command.split_whitespace().collect::<Vec<_>>();
-    words.len() == 3
-        && Path::new(words[0])
-            .file_name()
-            .and_then(|value| value.to_str())
-            == Some("resync")
-        && words[1..] == ["project", "sync"]
+    shell_command_segments(command).into_iter().any(|words| {
+        words.len() >= 3
+            && Path::new(&words[0])
+                .file_name()
+                .and_then(|value| value.to_str())
+                == Some("resync")
+            && words[1..3] == ["project", "sync"]
+    })
+}
+
+fn shell_command_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut segment = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    let flush_word = |word: &mut String, segment: &mut Vec<String>| {
+        if !word.is_empty() {
+            segment.push(std::mem::take(word));
+        }
+    };
+    let flush_segment = |segment: &mut Vec<String>, segments: &mut Vec<Vec<String>>| {
+        if !segment.is_empty() {
+            segments.push(std::mem::take(segment));
+        }
+    };
+
+    for character in command.chars() {
+        if escaped {
+            word.push(character);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') if character == '\'' => quote = None,
+            Some('"') if character == '"' => quote = None,
+            Some('"') if character == '\\' => escaped = true,
+            Some(_) => word.push(character),
+            None if character == '\\' => escaped = true,
+            None if character == '\'' || character == '"' => quote = Some(character),
+            None if character.is_whitespace() => flush_word(&mut word, &mut segment),
+            None if ";|&()".contains(character) => {
+                flush_word(&mut word, &mut segment);
+                flush_segment(&mut segment, &mut segments);
+            }
+            None => word.push(character),
+        }
+    }
+    if escaped {
+        word.push('\\');
+    }
+    flush_word(&mut word, &mut segment);
+    flush_segment(&mut segment, &mut segments);
+    segments
 }
 
 fn reconciliation_marker(directory: &Path, project_id: &str) -> PathBuf {
@@ -1100,7 +1155,7 @@ fn reconciliation_messages(
                 0o600,
             )?;
             let message = format!(
-                "RepoSync entered reconciliation mode after automatic reconciliation failed. Your workspace remains usable, but publication is paused. Reconcile `{branch}` with the latest `{remote_ref}`, then run `resync project sync` to verify the result and leave reconciliation mode."
+                "RepoSync entered reconciliation mode after automatic reconciliation failed. Your workspace remains usable, but publication is paused. Before continuing with the user's task, reconcile `{branch}` with the latest `{remote_ref}`. After resolving any conflicts, run `resync project sync` to verify the result and leave reconciliation mode. Do not perform unrelated work until synchronization succeeds or reconciliation requires user input."
             );
             return Ok((Some(message.clone()), Some(message)));
         }
@@ -1108,7 +1163,7 @@ fn reconciliation_messages(
             return Ok((
                 None,
                 Some(format!(
-                    "RepoSync reconciliation mode: reconcile against the latest `{remote_ref}`, then run `resync project sync` to verify and exit."
+                    "RepoSync reconciliation mode: prioritize reconciling the latest `{remote_ref}` and run `resync project sync` before unrelated work."
                 )),
             ));
         }
@@ -1175,13 +1230,15 @@ fn codex_hook(project_id: &str) -> Result<Value> {
         })) {
             Ok(result) => {
                 fs::create_dir_all(&directory)?;
-                write_json(
-                    &lease_path,
-                    &json!({
-                        "leaseId": result.get("lease_id"), "projectId": project_id, "toolUseId": input.get("tool_use_id")
-                    }),
-                    0o600,
-                )?;
+                if let Some(lease_id) = result.get("lease_id").and_then(Value::as_str) {
+                    write_json(
+                        &lease_path,
+                        &json!({
+                            "leaseId": lease_id, "projectId": project_id, "toolUseId": input.get("tool_use_id")
+                        }),
+                        0o600,
+                    )?;
+                }
                 let (system_message, mode_context) =
                     reconciliation_messages(&mode_marker, &input, &result)?;
                 let normal_context = result
@@ -1271,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_git_and_the_exact_reconciliation_command() {
+    fn recognizes_git_and_reconciliation_command_segments() {
         assert!(command_invokes_git("git status --short"));
         assert!(command_invokes_git(
             "cd repo && /usr/bin/git rebase resync/main"
@@ -1281,9 +1338,19 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": { "command": "resync project sync" }
         })));
-        assert!(!is_project_sync_command(&json!({
+        assert!(is_project_sync_command(&json!({
             "tool_name": "Bash",
             "tool_input": { "command": "git status && resync project sync" }
+        })));
+        assert!(is_project_sync_command(&json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "git add .gitignore && '/opt/RepoSync bin/resync' project sync prj_test"
+            }
+        })));
+        assert!(!is_project_sync_command(&json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "echo resync project sync" }
         })));
     }
 
@@ -1305,6 +1372,8 @@ mod tests {
         let entry = system.as_deref().unwrap();
         assert!(entry.contains("entered reconciliation mode"));
         assert!(entry.contains("`resync project sync`"));
+        assert!(entry.contains("Before continuing with the user's task"));
+        assert!(entry.contains("Do not perform unrelated work"));
         assert_eq!(context.as_deref(), Some(entry));
 
         let (system, context) = reconciliation_messages(&marker, &git_input, &state)?;
@@ -1312,6 +1381,7 @@ mod tests {
         let reminder = context.as_deref().unwrap();
         assert!(reminder.starts_with("RepoSync reconciliation mode:"));
         assert!(reminder.contains("`resync project sync`"));
+        assert!(reminder.contains("before unrelated work"));
         assert!(reminder.len() < entry.len());
 
         let non_git_input = json!({

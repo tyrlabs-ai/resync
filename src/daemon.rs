@@ -493,19 +493,35 @@ impl ResyncDaemon {
         } else {
             simple_outcome("deferred")
         };
-        let lease_id = gate
-            .activity(json!({
-                "sessionId": request.get("session_id"), "callId": request.get("call_id")
-            }))
-            .await;
-        self.inner
-            .lease_projects
-            .lock()
-            .await
-            .insert(lease_id.clone(), project_id.into());
+        let reconciliation_mode = {
+            let catalog = self.inner.catalog.lock().await;
+            find_project(&catalog, project_id)?.state == "CONFLICTED"
+        };
+        let lease_id = if reconciliation_mode {
+            None
+        } else {
+            let lease_id = gate
+                .activity(json!({
+                    "sessionId": request.get("session_id"), "callId": request.get("call_id")
+                }))
+                .await;
+            self.inner
+                .lease_projects
+                .lock()
+                .await
+                .insert(lease_id.clone(), project_id.into());
+            Some(lease_id)
+        };
         let catalog = self.inner.catalog.lock().await;
         let project = find_project(&catalog, project_id)?;
-        let head = capture_workspace(&project.local_path)?.head;
+        let head = git(
+            &project.local_path,
+            ["rev-parse", "HEAD"],
+            RunOptions::default(),
+        )?
+        .stdout
+        .trim()
+        .to_owned();
         let branch = project
             .active_branch
             .as_deref()
@@ -513,7 +529,7 @@ impl ResyncDaemon {
         Ok(json!({
             "granted": true, "lease_id": lease_id, "workspace_generation": project.workspace_generation,
             "branch_oid": head, "reconciliation": if reconciliation.outcome == "applied" { "applied" } else { "none" },
-            "reconciliation_mode": project.state == "CONFLICTED",
+            "reconciliation_mode": reconciliation_mode,
             "branch": branch,
             "remote_ref": format!("{}/{}", project.remote_name, branch),
             "changed_paths_summary": reconciliation.changed_paths.iter().take(50).collect::<Vec<_>>(),

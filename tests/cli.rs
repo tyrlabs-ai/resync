@@ -101,7 +101,14 @@ fn install_adapters_without_project_repairs_every_local_checkout() -> anyhow::Re
 
     for (repository, project_id) in [(&first, "prj_first"), (&second, "prj_second")] {
         let hooks = fs::read_to_string(repository.join(".codex/hooks.json"))?;
-        assert!(hooks.contains(&format!("resync codex-hook '{project_id}'")));
+        let hook_configuration: serde_json::Value = serde_json::from_str(&hooks)?;
+        for event in ["PreToolUse", "PostToolUse"] {
+            let command = hook_configuration["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .expect("generated RepoSync hook command");
+            assert_ne!(command, format!("resync codex-hook '{project_id}'"));
+            assert!(command.ends_with(&format!(" codex-hook '{project_id}'")));
+        }
         assert!(
             repository
                 .join(".agents/skills/reposync/SKILL.md")
