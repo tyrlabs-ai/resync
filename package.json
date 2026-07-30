@@ -10,6 +10,9 @@
   "bin": {
     "resync": "./bin/resync.js"
   },
+  "scripts": {
+    "postinstall": "node ./bin/resync.js install-adapters"
+  },
   "optionalDependencies": {
     "@tyrlabs-ai/resync-darwin-arm64": "0.3.2",
     "@tyrlabs-ai/resync-darwin-x64": "0.3.2",

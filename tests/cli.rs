@@ -54,6 +54,16 @@ fn version_and_help_are_available() {
 }
 
 #[test]
+fn npm_install_runs_catalog_wide_adapter_repair() -> anyhow::Result<()> {
+    let manifest: serde_json::Value = serde_json::from_str(include_str!("../package.json"))?;
+    assert_eq!(
+        manifest["scripts"]["postinstall"],
+        "node ./bin/resync.js install-adapters"
+    );
+    Ok(())
+}
+
+#[test]
 fn install_adapters_without_project_repairs_every_local_checkout() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let state = root.path().join("state");
