@@ -1,6 +1,6 @@
 {
   "name": "@tyrlabs-ai/resync-linux-x64",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "RepoSync native binary for Linux on x64",
   "files": ["bin/resync"],
   "os": ["linux"],
