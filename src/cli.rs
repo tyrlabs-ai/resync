@@ -3,6 +3,7 @@ use crate::credentials::{
     canonical_origin, erase_credential, load_credential, remove_device_identity,
 };
 use crate::daemon::{daemon_rpc, ensure_daemon_supervision, run_daemon, runtime};
+use crate::hook_dispatcher::{ensure_project_dispatcher, is_legacy_project_command, shell_quote};
 use crate::identity::{clear_identity, read_identity, repository_root, write_identity};
 use crate::peer::{AcceptOptions, peer_accept, peer_sync};
 use crate::process::{RunOptions, git, run as run_process};
@@ -833,10 +834,6 @@ fn doctor() -> Value {
     Value::Array(checks)
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 fn install_adapters_command(project_id: Option<&str>) -> Result<Value> {
     if let Some(project_id) = project_id {
         return install_adapters(project_id);
@@ -850,11 +847,14 @@ fn install_adapters_command(project_id: Option<&str>) -> Result<Value> {
         );
     }
     let supervision = ensure_daemon_supervision(false)?;
+    let requires_codex_trust_review = projects
+        .iter()
+        .any(|project| project["requiresCodexTrustReview"] == true);
     Ok(json!({
         "projectCount": projects.len(),
         "projects": projects,
         "daemonSupervision": supervision,
-        "requiresCodexTrustReview": !catalog.projects.is_empty()
+        "requiresCodexTrustReview": requires_codex_trust_review
     }))
 }
 
@@ -871,6 +871,13 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
 }
 
 pub(crate) fn install_project_adapters(project: &LocalProject) -> Result<Value> {
+    install_project_adapters_in_state(project, &state_paths().root)
+}
+
+pub(crate) fn install_project_adapters_in_state(
+    project: &LocalProject,
+    state_root: &Path,
+) -> Result<Value> {
     let project_id = &project.project_id;
     let codex_directory = project.local_path.join(".codex");
     let hooks_path = codex_directory.join("hooks.json");
@@ -882,12 +889,8 @@ pub(crate) fn install_project_adapters(project: &LocalProject) -> Result<Value> 
     };
     let original_hooks = hooks.clone();
     let executable = std::env::current_exe()?;
-    let hook_suffix = format!(" codex-hook {}", shell_quote(project_id));
-    let legacy_marker = format!("resync{hook_suffix}");
-    let marker = format!(
-        "{}{hook_suffix}",
-        shell_quote(&executable.to_string_lossy()),
-    );
+    let dispatcher = ensure_project_dispatcher(state_root, project_id, &executable)?;
+    let marker = shell_quote(&dispatcher.to_string_lossy());
     for event in ["PreToolUse", "PostToolUse"] {
         let groups = hooks
             .pointer_mut(&format!("/hooks/{event}"))
@@ -896,27 +899,36 @@ pub(crate) fn install_project_adapters(project: &LocalProject) -> Result<Value> 
             hooks["hooks"][event] = Value::Array(Vec::new());
         }
         let groups = hooks["hooks"][event].as_array_mut().unwrap();
-        groups.retain(|group| {
-            !group
-                .get("hooks")
-                .and_then(Value::as_array)
-                .is_some_and(|items| {
-                    items.iter().any(|item| {
-                        item.get("command")
-                            .and_then(Value::as_str)
-                            .is_some_and(|command| {
-                                command == legacy_marker || command.ends_with(&hook_suffix)
-                            })
-                    })
-                })
+        let mut marker_found = false;
+        groups.retain_mut(|group| {
+            let Some(items) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            items.retain(|item| {
+                let Some(command) = item.get("command").and_then(Value::as_str) else {
+                    return true;
+                };
+                if command == marker {
+                    if marker_found {
+                        return false;
+                    }
+                    marker_found = true;
+                    return true;
+                }
+                !is_legacy_project_command(command, project_id)
+            });
+            !items.is_empty()
         });
-        groups.push(json!({ "matcher": "*", "hooks": [{
-            "type": "command", "command": marker, "timeout": 3600,
-            "statusMessage": if event == "PreToolUse" { "Refreshing RepoSync workspace" } else { "Releasing RepoSync workspace" }
-        }] }));
+        if !marker_found {
+            groups.push(json!({ "matcher": "*", "hooks": [{
+                "type": "command", "command": marker, "timeout": 3600,
+                "statusMessage": if event == "PreToolUse" { "Refreshing RepoSync workspace" } else { "Releasing RepoSync workspace" }
+            }] }));
+        }
     }
     fs::create_dir_all(&codex_directory)?;
-    if !hooks_existed || hooks != original_hooks {
+    let requires_codex_trust_review = !hooks_existed || hooks != original_hooks;
+    if requires_codex_trust_review {
         write_json(&hooks_path, &hooks, 0o644)?;
     }
     let skill_directory = project
@@ -973,8 +985,9 @@ pub(crate) fn install_project_adapters(project: &LocalProject) -> Result<Value> 
     fs::set_permissions(&checkout_hook, fs::Permissions::from_mode(0o755))?;
     Ok(
         json!({ "projectId": project_id, "codexHooks": hooks_path, "codexSkill": skill_path,
+            "codexHookDispatcher": dispatcher,
             "gitHooks": { "postCommit": hook_path, "postCheckout": checkout_hook },
-            "requiresCodexTrustReview": true }),
+            "requiresCodexTrustReview": requires_codex_trust_review }),
     )
 }
 

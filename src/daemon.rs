@@ -1389,7 +1389,7 @@ fn repair_adapters_for_build(
     let failures = projects
         .iter()
         .filter_map(|project| {
-            crate::cli::install_project_adapters(project)
+            crate::cli::install_project_adapters_in_state(project, &paths.root)
                 .err()
                 .map(|error| format!("{}: {error:#}", project.project_id))
         })
@@ -1626,7 +1626,7 @@ mod tests {
             std::slice::from_ref(&project),
             "build-one"
         )?);
-        assert!(fs::read_to_string(&hooks)?.contains("codex-hook"));
+        assert!(fs::read_to_string(&hooks)?.contains("hook-dispatchers/codex-"));
 
         fs::write(&hooks, "{}\n")?;
         assert!(!repair_adapters_for_build(
@@ -1637,7 +1637,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&hooks)?, "{}\n");
 
         assert!(repair_adapters_for_build(&paths, &[project], "build-two")?);
-        assert!(fs::read_to_string(hooks)?.contains("codex-hook"));
+        assert!(fs::read_to_string(hooks)?.contains("hook-dispatchers/codex-"));
         Ok(())
     }
 

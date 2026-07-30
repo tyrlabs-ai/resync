@@ -129,13 +129,17 @@ fn install_adapters_without_project_repairs_every_local_checkout() -> anyhow::Re
                 .iter()
                 .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
                 .filter_map(|hook| hook["command"].as_str())
-                .filter(|command| command.ends_with(&format!(" codex-hook '{project_id}'")))
+                .filter(|command| command.contains("hook-dispatchers/codex-"))
                 .collect::<Vec<_>>();
             assert_eq!(generated.len(), 1, "one current RepoSync hook per event");
             let command = generated[0];
-            assert_ne!(command, format!("resync codex-hook '{project_id}'"));
-            assert!(command.ends_with(&format!(" codex-hook '{project_id}'")));
+            assert!(!command.contains(" codex-hook "));
             assert!(!command.contains("/obsolete/resync"));
+            let dispatcher = std::path::PathBuf::from(command.trim_matches('\''));
+            let script = fs::read_to_string(&dispatcher)?;
+            assert!(script.contains("# RepoSync Codex hook dispatcher v1"));
+            assert!(script.contains(&format!("codex-hook '{project_id}'")));
+            assert!(dispatcher.with_extension("resync").exists());
         }
         if project_id == "prj_first" {
             assert_eq!(
@@ -160,6 +164,122 @@ fn install_adapters_without_project_repairs_every_local_checkout() -> anyhow::Re
                 .contains(&format!("report-checkout '{project_id}'"))
         );
     }
+    Ok(())
+}
+
+#[test]
+fn adapter_upgrade_migrates_versioned_hooks_to_a_stable_dispatcher() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let repository = root.path().join("project");
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .arg(&repository)
+        .status()?;
+    anyhow::ensure!(status.success(), "could not initialize test repository");
+    let project_id = "prj_upgrade";
+    write_json(
+        &state.join("catalog.json"),
+        &LocalCatalog {
+            catalog_generation: 1,
+            projects: vec![local_project(project_id, repository.clone())],
+        },
+        0o600,
+    )?;
+    write_json(
+        &repository.join(".codex/hooks.json"),
+        &serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "'/old/npm/resync' codex-hook 'prj_upgrade'"
+                        },
+                        {
+                            "type": "command",
+                            "command": "echo preserved"
+                        }
+                    ]
+                }],
+                "PostToolUse": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "'/old/npm/resync' codex-hook 'prj_upgrade'"
+                    }]
+                }]
+            }
+        }),
+        0o644,
+    )?;
+
+    let install = || -> anyhow::Result<serde_json::Value> {
+        let assertion = Command::cargo_bin("resync")
+            .unwrap()
+            .env("RESYNC_STATE_DIR", &state)
+            .args(["install-adapters", project_id])
+            .assert()
+            .success();
+        Ok(serde_json::from_slice(&assertion.get_output().stdout)?)
+    };
+    let first_install = install()?;
+    assert_eq!(first_install["requiresCodexTrustReview"], true);
+
+    let hooks_path = repository.join(".codex/hooks.json");
+    let hooks: serde_json::Value = serde_json::from_slice(&fs::read(&hooks_path)?)?;
+    let mut dispatcher = None;
+    for event in ["PreToolUse", "PostToolUse"] {
+        let commands = hooks["hooks"][event]
+            .as_array()
+            .expect("generated hook groups")
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
+            .filter_map(|hook| hook["command"].as_str())
+            .collect::<Vec<_>>();
+        let generated = commands
+            .iter()
+            .filter(|command| command.contains("hook-dispatchers/codex-"))
+            .collect::<Vec<_>>();
+        assert_eq!(generated.len(), 1, "one stable dispatcher per event");
+        assert!(
+            commands
+                .iter()
+                .all(|command| !command.contains("/old/npm/resync")),
+            "old versioned hook was not removed"
+        );
+        let path = std::path::PathBuf::from(generated[0].trim_matches('\''));
+        assert!(
+            path.is_file(),
+            "dispatcher does not exist: {}",
+            path.display()
+        );
+        assert_eq!(dispatcher.get_or_insert(path.clone()), &path);
+    }
+    assert!(
+        hooks["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("pre-tool groups")
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
+            .any(|hook| hook["command"] == "echo preserved"),
+        "an unrelated handler in the migrated group was removed"
+    );
+    let dispatcher = dispatcher.expect("stable hook dispatcher");
+    let script = fs::read_to_string(&dispatcher)?;
+    assert!(script.contains("# RepoSync Codex hook dispatcher v1"));
+    assert!(script.contains("codex-hook 'prj_upgrade'"));
+    assert!(dispatcher.with_extension("resync").exists());
+
+    let approved_definition = fs::read(&hooks_path)?;
+    let reinstall = install()?;
+    assert_eq!(reinstall["requiresCodexTrustReview"], false);
+    assert_eq!(
+        fs::read(&hooks_path)?,
+        approved_definition,
+        "reinstalling RepoSync changed the approved hook definition"
+    );
     Ok(())
 }
 
@@ -204,7 +324,26 @@ project_id = "prj_second"
             "hooks": {
                 "PreToolUse": [{
                     "matcher": "Bash",
-                    "hooks": [{ "type": "command", "command": "echo preserved" }]
+                    "hooks": [
+                        { "type": "command", "command": "echo preserved" },
+                        {
+                            "type": "command",
+                            "command": format!(
+                                "'/old/npm/resync' codex-workspace-hook '{}'",
+                                workspace.join(".resync-workspace.toml").display()
+                            )
+                        }
+                    ]
+                }],
+                "PostToolUse": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!(
+                            "'/old/npm/resync' codex-workspace-hook '{}'",
+                            workspace.join(".resync-workspace.toml").display()
+                        )
+                    }]
                 }]
             }
         }),
@@ -222,8 +361,10 @@ project_id = "prj_second"
     assert_eq!(output["projectCount"], 2);
     assert_eq!(output["requiresCodexTrustReview"], true);
 
-    let hooks: serde_json::Value =
-        serde_json::from_slice(&fs::read(workspace.join(".codex/hooks.json"))?)?;
+    let hooks_path = workspace.join(".codex/hooks.json");
+    let approved_definition = fs::read(&hooks_path)?;
+    let hooks: serde_json::Value = serde_json::from_slice(&approved_definition)?;
+    let mut dispatcher = None;
     for event in ["PreToolUse", "PostToolUse"] {
         let commands = hooks["hooks"][event]
             .as_array()
@@ -232,26 +373,48 @@ project_id = "prj_second"
             .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
             .filter_map(|hook| hook["command"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|command| command.contains(" codex-workspace-hook "))
-                .count(),
-            1,
-            "one umbrella RepoSync dispatcher per event"
-        );
-        assert!(commands.iter().any(|command| {
-            command.contains(
-                workspace
-                    .join(".resync-workspace.toml")
-                    .to_string_lossy()
-                    .as_ref(),
-            )
-        }));
+        let generated = commands
+            .iter()
+            .filter(|command| command.contains("hook-dispatchers/codex-workspace-"))
+            .collect::<Vec<_>>();
+        assert_eq!(generated.len(), 1, "one umbrella dispatcher per event");
+        assert!(!generated[0].contains(" codex-workspace-hook "));
+        let path = std::path::PathBuf::from(generated[0].trim_matches('\''));
+        assert!(path.is_file());
+        assert_eq!(dispatcher.get_or_insert(path.clone()), &path);
     }
+    let dispatcher = dispatcher.expect("stable workspace dispatcher");
+    let script = fs::read_to_string(&dispatcher)?;
+    assert!(script.contains("# RepoSync Codex workspace hook dispatcher v1"));
+    assert!(script.contains("codex-workspace-hook"));
+    assert!(
+        script.contains(
+            workspace
+                .join(".resync-workspace.toml")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert!(dispatcher.with_extension("resync").exists());
     assert_eq!(
         hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
         "echo preserved"
+    );
+
+    let reinstall = Command::cargo_bin("resync")
+        .unwrap()
+        .env("RESYNC_STATE_DIR", &state)
+        .args(["workspace", "install-hooks"])
+        .arg(&workspace)
+        .assert()
+        .success();
+    let reinstall_output: serde_json::Value =
+        serde_json::from_slice(&reinstall.get_output().stdout)?;
+    assert_eq!(reinstall_output["requiresCodexTrustReview"], false);
+    assert_eq!(
+        fs::read(&hooks_path)?,
+        approved_definition,
+        "reinstalling RepoSync changed the approved umbrella hook definition"
     );
     Ok(())
 }

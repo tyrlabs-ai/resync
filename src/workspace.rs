@@ -1,4 +1,7 @@
-use crate::state::{load_catalog, write_json};
+use crate::hook_dispatcher::{
+    ensure_workspace_dispatcher, is_legacy_workspace_command, shell_quote,
+};
+use crate::state::{load_catalog, state_paths, write_json};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -34,10 +37,6 @@ pub struct Workspace {
     pub root: PathBuf,
     pub manifest_path: PathBuf,
     pub projects: Vec<WorkspaceProject>,
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 pub fn load_workspace(manifest_path: &Path) -> Result<Workspace> {
@@ -145,7 +144,8 @@ pub fn install_hooks(root: &Path) -> Result<Value> {
 
     let codex_directory = root.join(".codex");
     let hooks_path = codex_directory.join("hooks.json");
-    let mut hooks: Value = if hooks_path.exists() {
+    let hooks_existed = hooks_path.exists();
+    let mut hooks: Value = if hooks_existed {
         serde_json::from_slice(&fs::read(&hooks_path)?)?
     } else {
         json!({
@@ -160,57 +160,69 @@ pub fn install_hooks(root: &Path) -> Result<Value> {
         hooks["hooks"] = json!({});
     }
 
+    let original_hooks = hooks.clone();
     let executable = std::env::current_exe()?;
-    let command = format!(
-        "{} codex-workspace-hook {}",
-        shell_quote(&executable.to_string_lossy()),
-        shell_quote(&workspace.manifest_path.to_string_lossy())
-    );
+    let dispatcher =
+        ensure_workspace_dispatcher(&state_paths().root, &workspace.manifest_path, &executable)?;
+    let command = shell_quote(&dispatcher.to_string_lossy());
     for event in ["PreToolUse", "PostToolUse"] {
         if !hooks["hooks"].get(event).is_some_and(Value::is_array) {
             hooks["hooks"][event] = Value::Array(Vec::new());
         }
         let groups = hooks["hooks"][event].as_array_mut().unwrap();
-        groups.retain(|group| {
-            !group
-                .get("hooks")
-                .and_then(Value::as_array)
-                .is_some_and(|handlers| {
-                    handlers.iter().any(|handler| {
-                        handler
-                            .get("command")
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| value.contains(" codex-workspace-hook "))
-                    })
-                })
-        });
-        groups.push(json!({
-            "matcher": "*",
-            "hooks": [{
-                "type": "command",
-                "command": command,
-                "timeout": 3600,
-                "statusMessage": if event == "PreToolUse" {
-                    "Refreshing RepoSync workspace projects"
-                } else {
-                    "Releasing RepoSync workspace projects"
+        let mut command_found = false;
+        groups.retain_mut(|group| {
+            let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            handlers.retain(|handler| {
+                let Some(value) = handler.get("command").and_then(Value::as_str) else {
+                    return true;
+                };
+                if value == command {
+                    if command_found {
+                        return false;
+                    }
+                    command_found = true;
+                    return true;
                 }
-            }]
-        }));
+                !is_legacy_workspace_command(value, &workspace.manifest_path)
+            });
+            !handlers.is_empty()
+        });
+        if !command_found {
+            groups.push(json!({
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": command,
+                    "timeout": 3600,
+                    "statusMessage": if event == "PreToolUse" {
+                        "Refreshing RepoSync workspace projects"
+                    } else {
+                        "Releasing RepoSync workspace projects"
+                    }
+                }]
+            }));
+        }
     }
     fs::create_dir_all(&codex_directory)?;
-    write_json(&hooks_path, &hooks, 0o644)?;
+    let requires_codex_trust_review = !hooks_existed || hooks != original_hooks;
+    if requires_codex_trust_review {
+        write_json(&hooks_path, &hooks, 0o644)?;
+    }
 
     Ok(json!({
         "workspaceRoot": workspace.root,
         "manifestPath": workspace.manifest_path,
         "hooksPath": hooks_path,
+        "codexHookDispatcher": dispatcher,
         "projectCount": workspace.projects.len(),
         "projects": workspace.projects.iter().map(|project| json!({
             "projectId": project.project_id,
             "path": project.local_path
         })).collect::<Vec<_>>(),
-        "requiresCodexTrustReview": true
+        "requiresCodexTrustReview": requires_codex_trust_review
     }))
 }
 

@@ -3,6 +3,7 @@ pub mod config;
 pub mod credentials;
 pub mod daemon;
 pub mod git_state;
+mod hook_dispatcher;
 pub mod identity;
 pub mod peer;
 pub mod process;

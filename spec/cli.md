@@ -75,8 +75,11 @@ account.
 root. Each `[[project]]` entry names a relative child path and MAY assert its
 RepoSync project ID. Paths outside the workspace, duplicate projects,
 non-subscribed checkouts, and mismatched IDs are rejected before the parent
-Codex hook file is changed. The generated hook is local adapter state and MUST
-NOT be committed merely to propagate machine-specific executable paths.
+Codex hook file is changed. Project and workspace hooks invoke stable,
+machine-local dispatchers whose executable targets are atomically updated
+during RepoSync upgrades. A repair MUST leave an already-current hook definition
+byte-for-byte unchanged. Generated hooks are local adapter state and MUST NOT be
+committed merely to propagate machine-specific paths.
 
 A peer bootstrap environment MAY export `RESYNC_PEER_PROJECT_PATH` to select
 its active checkout when the caller does not pass an explicit path. The

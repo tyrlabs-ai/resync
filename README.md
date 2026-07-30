@@ -98,7 +98,7 @@ reconciled immediately in the background. If a participating tool call is
 active, installation waits for its lease to end and completes before another
 call is admitted.
 
-Enrollment automatically installs the bundled RepoSync skill at `.agents/skills/reposync`, merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json`, and installs a chainable, signal-only Git `post-commit` hook. `resync install-adapters` remains available as a catalog-wide repair command, with an optional project ID for a single-checkout repair. A hook starts the daemon if necessary, so a commit notification is not lost merely because no daemon process was already running. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. The pre-tool hook coordinates an activity lease when RepoSync is available and otherwise lets the tool continue with a warning; the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
+Enrollment automatically installs the bundled RepoSync skill at `.agents/skills/reposync`, merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json`, and installs a chainable, signal-only Git `post-commit` hook. `resync install-adapters` remains available as a catalog-wide repair command, with an optional project ID for a single-checkout repair. A hook starts the daemon if necessary, so a commit notification is not lost merely because no daemon process was already running. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. Each approved hook invokes a stable per-project dispatcher whose target is atomically updated when RepoSync is upgraded, so ordinary upgrades do not rewrite the approved hook definition. The pre-tool hook coordinates an activity lease when RepoSync is available and otherwise lets the tool continue with a warning; the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
 
 When one Codex project root contains multiple enrolled Git repositories, define
 the membership explicitly in `<workspace>/.resync-workspace.toml`:
@@ -119,7 +119,9 @@ Run `resync workspace install-hooks <workspace>` once on each machine. RepoSync
 validates that every relative path remains beneath the workspace root, resolves
 to a locally subscribed checkout, and matches the optional project ID. It then
 merges one umbrella `PreToolUse` and `PostToolUse` dispatcher into the parent
-`.codex/hooks.json`. Review that parent hook once in Codex. Each tool cycle is
+`.codex/hooks.json`. Review that stable parent hook once in Codex; later RepoSync
+upgrades atomically retarget its machine-local executable without changing the
+approved definition. Each tool cycle is
 coordinated across the configured projects in manifest order and released in
 reverse order. RepoSync does not execute nested projects' arbitrary Codex hook
 commands through this dispatcher.
