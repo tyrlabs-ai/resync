@@ -1444,6 +1444,57 @@ fn terminate_stale_daemon(ping: &Value) -> Result<()> {
     bail!("stale RepoSync daemon {pid} did not stop after SIGTERM")
 }
 
+pub(crate) fn ensure_daemon_supervision(restart: bool) -> Result<&'static str> {
+    // An explicit state directory is an isolated CLI/test instance. It must not
+    // rewrite or start the user's global systemd service with this executable.
+    if std::env::var_os("RESYNC_STATE_DIR").is_some() {
+        return Ok("state-dir");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let available = run(
+            "systemctl",
+            ["--user", "show-environment"],
+            RunOptions {
+                allow_failure: true,
+                ..RunOptions::default()
+            },
+        )
+        .is_ok_and(|value| value.code == 0);
+        if available {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .context("HOME is unavailable")?;
+            let directory = home.join(".config/systemd/user");
+            fs::create_dir_all(&directory)?;
+            let executable = std::env::current_exe()?;
+            fs::write(
+                directory.join("resync.service"),
+                format!(
+                    "[Unit]\nDescription=RepoSync convergence daemon\nAfter=network-online.target\n\n[Service]\nExecStart={} daemon\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+                    executable.display()
+                ),
+            )?;
+            run(
+                "systemctl",
+                ["--user", "daemon-reload"],
+                RunOptions::default(),
+            )?;
+            run(
+                "systemctl",
+                if restart {
+                    vec!["--user", "restart", "resync.service"]
+                } else {
+                    vec!["--user", "enable", "--now", "resync.service"]
+                },
+                RunOptions::default(),
+            )?;
+            return Ok("systemd-user");
+        }
+    }
+    Ok("hook-started")
+}
+
 pub fn daemon_rpc(request: &Value) -> Result<Value> {
     let binary_id = executable_fingerprint()?;
     if let Ok(ping) = crate::rpc::rpc(&json!({ "method": "ping" }), None) {
@@ -1455,31 +1506,33 @@ pub fn daemon_rpc(request: &Value) -> Result<Value> {
     let paths = state_paths();
     fs::create_dir_all(&paths.root)?;
     let log_path = paths.root.join("daemon.log");
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let executable = std::env::current_exe()?;
-    let mut command = std::process::Command::new(executable);
-    command
-        .arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid has no memory-safety preconditions and is called after fork before exec.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+    if ensure_daemon_supervision(true)? != "systemd-user" {
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let executable = std::env::current_exe()?;
+        let mut command = std::process::Command::new(executable);
+        command
+            .arg("daemon")
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: setsid has no memory-safety preconditions and is called after fork before exec.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
+        command.spawn()?;
     }
-    command.spawn()?;
     let mut last = None;
     for _ in 0..150 {
         std::thread::sleep(Duration::from_millis(100));

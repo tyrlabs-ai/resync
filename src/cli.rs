@@ -2,7 +2,7 @@ use crate::config::ensure_project_config;
 use crate::credentials::{
     canonical_origin, erase_credential, load_credential, remove_device_identity,
 };
-use crate::daemon::{daemon_rpc, run_daemon, runtime};
+use crate::daemon::{daemon_rpc, ensure_daemon_supervision, run_daemon, runtime};
 use crate::identity::{clear_identity, read_identity, repository_root, write_identity};
 use crate::peer::{AcceptOptions, peer_accept, peer_sync};
 use crate::process::{RunOptions, git, run as run_process};
@@ -689,7 +689,7 @@ pub(crate) fn register_project_with_daemon(
     project: &LocalProject,
     generation: Option<u64>,
 ) -> Result<()> {
-    ensure_daemon_supervision()?;
+    ensure_daemon_supervision(false)?;
     let mut request = json!({
         "method": "registerProject",
         "project": project
@@ -819,7 +819,7 @@ fn install_adapters_command(project_id: Option<&str>) -> Result<Value> {
                 .with_context(|| format!("install adapters for {}", project.project_id))?,
         );
     }
-    let supervision = ensure_daemon_supervision()?;
+    let supervision = ensure_daemon_supervision(false)?;
     Ok(json!({
         "projectCount": projects.len(),
         "projects": projects,
@@ -836,7 +836,7 @@ pub fn install_adapters(project_id: &str) -> Result<Value> {
         .find(|item| item.project_id == project_id)
         .ok_or_else(|| anyhow::anyhow!("project {project_id} is not subscribed"))?;
     let mut result = install_project_adapters(project)?;
-    result["daemonSupervision"] = Value::String(ensure_daemon_supervision()?.into());
+    result["daemonSupervision"] = Value::String(ensure_daemon_supervision(false)?.into());
     Ok(result)
 }
 
@@ -944,53 +944,6 @@ pub(crate) fn install_project_adapters(project: &LocalProject) -> Result<Value> 
             "gitHooks": { "postCommit": hook_path, "postCheckout": checkout_hook },
             "requiresCodexTrustReview": true }),
     )
-}
-
-fn ensure_daemon_supervision() -> Result<&'static str> {
-    // An explicit state directory is an isolated CLI/test instance. It must not
-    // rewrite or start the user's global systemd service with this executable.
-    if std::env::var_os("RESYNC_STATE_DIR").is_some() {
-        return Ok("state-dir");
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let available = run_process(
-            "systemctl",
-            ["--user", "show-environment"],
-            RunOptions {
-                allow_failure: true,
-                ..RunOptions::default()
-            },
-        )
-        .is_ok_and(|value| value.code == 0);
-        if available {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .context("HOME is unavailable")?;
-            let directory = home.join(".config/systemd/user");
-            fs::create_dir_all(&directory)?;
-            let executable = std::env::current_exe()?;
-            fs::write(
-                directory.join("resync.service"),
-                format!(
-                    "[Unit]\nDescription=RepoSync convergence daemon\nAfter=network-online.target\n\n[Service]\nExecStart={} daemon\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
-                    executable.display()
-                ),
-            )?;
-            run_process(
-                "systemctl",
-                ["--user", "daemon-reload"],
-                RunOptions::default(),
-            )?;
-            run_process(
-                "systemctl",
-                ["--user", "enable", "--now", "resync.service"],
-                RunOptions::default(),
-            )?;
-            return Ok("systemd-user");
-        }
-    }
-    Ok("hook-started")
 }
 
 fn ensure_local_excludes(project_path: &Path, patterns: &[&str]) -> Result<()> {
