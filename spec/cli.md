@@ -38,6 +38,8 @@ peer
 daemon
 doctor
 install-adapters [PROJECT_ID]        # repair all local projects, or one selected project
+workspace
+  install-hooks [WORKSPACE_ROOT]     # install one explicit multi-project Codex dispatcher
 ```
 
 Compatibility aliases from the engineering preview MAY remain, but grouped commands are canonical. A non-command first positional value is treated as an SSH target only while inside an enrolled Git checkout; unknown command-like values outside that context produce help and an error.
@@ -58,6 +60,7 @@ resync auth login https://provider.example --token-command 'pass show resync/boo
 resync project init --name api
 resync project join prj_example
 resync project fork --name isolated-experiment
+resync workspace install-hooks /work/reposync
 resync yolopods-t3-peer
 resync peer sync builder:/work/api
 ```
@@ -67,6 +70,13 @@ account. It is the normal way to materialize an account project on another
 already-registered device and requires neither an invitation nor SSH. `peer
 sync` is reserved for enrolling a target that has no device identity for the
 account.
+
+`workspace install-hooks` reads `.resync-workspace.toml` from the workspace
+root. Each `[[project]]` entry names a relative child path and MAY assert its
+RepoSync project ID. Paths outside the workspace, duplicate projects,
+non-subscribed checkouts, and mismatched IDs are rejected before the parent
+Codex hook file is changed. The generated hook is local adapter state and MUST
+NOT be committed merely to propagate machine-specific executable paths.
 
 A peer bootstrap environment MAY export `RESYNC_PEER_PROJECT_PATH` to select
 its active checkout when the caller does not pass an explicit path. The

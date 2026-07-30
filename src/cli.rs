@@ -14,6 +14,7 @@ use crate::state::{
     LocalProject, load_catalog, load_config_raw, read_json, state_paths, write_json,
 };
 use crate::transaction::recover_transaction;
+use crate::workspace::{install_hooks as install_workspace_hooks, load_workspace};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use reqwest::Method;
@@ -85,6 +86,11 @@ enum Command {
         #[arg(value_name = "PROJECT_ID")]
         project_id: Option<String>,
     },
+    #[command(about = "Manage explicit multi-project Codex workspaces")]
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
     #[command(about = "Acquire one cooperative tool-call lease")]
     Acquire {
         project_id: String,
@@ -95,6 +101,8 @@ enum Command {
     Release { lease_id: String },
     #[command(name = "codex-hook", hide = true)]
     CodexHook { project_id: String },
+    #[command(name = "codex-workspace-hook", hide = true)]
+    CodexWorkspaceHook { manifest: PathBuf },
     #[command(name = "report-commit", hide = true)]
     ReportCommit {
         project_id: String,
@@ -107,6 +115,15 @@ enum Command {
         previous_oid: String,
         new_oid: String,
         new_branch: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommand {
+    #[command(about = "Install an umbrella Codex hook from .resync-workspace.toml")]
+    InstallHooks {
+        #[arg(value_name = "WORKSPACE_ROOT")]
+        root: Option<PathBuf>,
     },
 }
 
@@ -279,9 +296,11 @@ fn preprocess_arguments() -> Vec<String> {
         "daemon",
         "doctor",
         "install-adapters",
+        "workspace",
         "acquire",
         "release",
         "codex-hook",
+        "codex-workspace-hook",
         "report-commit",
         "report-checkout",
         "help",
@@ -348,6 +367,7 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
         Command::InstallAdapters { project_id } => {
             Ok(Some(install_adapters_command(project_id.as_deref())?))
         }
+        Command::Workspace { command } => Ok(Some(workspace(command)?)),
         Command::Acquire {
             project_id,
             session_id,
@@ -361,6 +381,7 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             &json!({ "method": "releaseAccess", "lease_id": lease_id, "outcome": "success", "mutation_hint": "possible" }),
         )?)),
         Command::CodexHook { project_id } => Ok(Some(codex_hook(&project_id)?)),
+        Command::CodexWorkspaceHook { manifest } => Ok(Some(codex_workspace_hook(&manifest)?)),
         Command::ReportCommit {
             project_id,
             commit_oid,
@@ -380,6 +401,15 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             "new_oid": new_oid,
             "new_branch": new_branch
         }))?)),
+    }
+}
+
+fn workspace(command: WorkspaceCommand) -> Result<Value> {
+    match command {
+        WorkspaceCommand::InstallHooks { root } => {
+            let root = root.unwrap_or(std::env::current_dir()?);
+            install_workspace_hooks(&root)
+        }
     }
 }
 
@@ -1148,7 +1178,7 @@ fn hook_output(system_message: Option<String>, additional_context: Option<String
     output
 }
 
-fn codex_hook(project_id: &str) -> Result<Value> {
+fn read_codex_hook_input() -> Result<Value> {
     let mut source = String::new();
     std::io::stdin()
         .take(1024 * 1024 + 1)
@@ -1156,22 +1186,35 @@ fn codex_hook(project_id: &str) -> Result<Value> {
     if source.len() > 1024 * 1024 {
         bail!("hook input exceeds 1 MiB");
     }
-    let input: Value = serde_json::from_str(&source)?;
+    Ok(serde_json::from_str(&source)?)
+}
+
+fn codex_hook(project_id: &str) -> Result<Value> {
+    let input = read_codex_hook_input()?;
+    codex_hook_for_input(project_id, &input)
+}
+
+fn codex_hook_for_input(project_id: &str, input: &Value) -> Result<Value> {
     let directory = state_paths().root.join("codex-leases").join(safe_hook_part(
         input.get("session_id").and_then(Value::as_str),
     ));
     let lease_path = directory.join(format!(
+        "{}-{}.json",
+        safe_hook_part(Some(project_id)),
+        safe_hook_part(input.get("tool_use_id").and_then(Value::as_str))
+    ));
+    let legacy_lease_path = directory.join(format!(
         "{}.json",
         safe_hook_part(input.get("tool_use_id").and_then(Value::as_str))
     ));
     let mode_marker = reconciliation_marker(&directory, project_id);
     match input.get("hook_event_name").and_then(Value::as_str) {
-        Some("PreToolUse") if is_project_sync_command(&input) => {
+        Some("PreToolUse") if is_project_sync_command(input) => {
             match daemon_rpc(&json!({ "method": "accessState", "project_id": project_id })) {
                 Ok(state) => {
                     fs::create_dir_all(&directory)?;
                     let (system_message, additional_context) =
-                        reconciliation_messages(&mode_marker, &input, &state)?;
+                        reconciliation_messages(&mode_marker, input, &state)?;
                     Ok(hook_output(system_message, additional_context))
                 }
                 Err(error) => Ok(json!({
@@ -1195,7 +1238,7 @@ fn codex_hook(project_id: &str) -> Result<Value> {
                     )?;
                 }
                 let (system_message, mode_context) =
-                    reconciliation_messages(&mode_marker, &input, &result)?;
+                    reconciliation_messages(&mode_marker, input, &result)?;
                 let normal_context = result
                     .get("model_message")
                     .and_then(Value::as_str)
@@ -1206,11 +1249,11 @@ fn codex_hook(project_id: &str) -> Result<Value> {
                 "systemMessage": format!("RepoSync access coordination is unavailable; the tool call will continue: {error:#}")
             })),
         },
-        Some("PostToolUse") if is_project_sync_command(&input) => {
+        Some("PostToolUse") if is_project_sync_command(input) => {
             match daemon_rpc(&json!({ "method": "accessState", "project_id": project_id })) {
                 Ok(state) => {
                     let (system_message, additional_context) =
-                        reconciliation_messages(&mode_marker, &input, &state)?;
+                        reconciliation_messages(&mode_marker, input, &state)?;
                     let mut output = hook_output(system_message, additional_context);
                     if let Some(value) = output.get_mut("hookSpecificOutput") {
                         value["hookEventName"] = Value::String("PostToolUse".into());
@@ -1223,9 +1266,13 @@ fn codex_hook(project_id: &str) -> Result<Value> {
             }
         }
         Some("PostToolUse") => {
-            if !lease_path.exists() {
+            let lease_path = if lease_path.exists() {
+                lease_path
+            } else if legacy_lease_path.exists() {
+                legacy_lease_path
+            } else {
                 return Ok(json!({}));
-            }
+            };
             match (|| -> Result<()> {
                 let lease: Value = serde_json::from_slice(&fs::read(&lease_path)?)?;
                 daemon_rpc(
@@ -1242,6 +1289,60 @@ fn codex_hook(project_id: &str) -> Result<Value> {
         }
         _ => Ok(json!({})),
     }
+}
+
+fn merge_workspace_hook_outputs(event_name: &str, outputs: Vec<(String, Value)>) -> Value {
+    let mut system_messages = Vec::new();
+    let mut additional_contexts = Vec::new();
+    for (project_id, output) in outputs {
+        if let Some(message) = output.get("systemMessage").and_then(Value::as_str) {
+            system_messages.push(format!("[{project_id}] {message}"));
+        }
+        if let Some(context) = output
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+        {
+            additional_contexts.push(format!("[{project_id}] {context}"));
+        }
+    }
+    let mut output = json!({});
+    if !system_messages.is_empty() {
+        output["systemMessage"] = Value::String(system_messages.join("\n"));
+    }
+    if !additional_contexts.is_empty() {
+        output["hookSpecificOutput"] = json!({
+            "hookEventName": event_name,
+            "additionalContext": additional_contexts.join("\n")
+        });
+    }
+    output
+}
+
+fn codex_workspace_hook(manifest: &Path) -> Result<Value> {
+    let input = read_codex_hook_input()?;
+    let event_name = input
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let workspace = load_workspace(manifest)?;
+    let mut projects = workspace.projects.iter().collect::<Vec<_>>();
+    if event_name == "PostToolUse" {
+        projects.reverse();
+    }
+    let outputs = projects
+        .into_iter()
+        .map(|project| {
+            let output = codex_hook_for_input(&project.project_id, &input).unwrap_or_else(|error| {
+                json!({
+                    "systemMessage": format!(
+                        "RepoSync workspace coordination failed; the tool call will continue: {error:#}"
+                    )
+                })
+            });
+            (project.project_id.clone(), output)
+        })
+        .collect();
+    Ok(merge_workspace_hook_outputs(event_name, outputs))
 }
 
 fn parse_duration(value: &str) -> Result<Duration> {

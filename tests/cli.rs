@@ -162,3 +162,133 @@ fn install_adapters_without_project_repairs_every_local_checkout() -> anyhow::Re
     }
     Ok(())
 }
+
+#[test]
+fn workspace_install_hooks_writes_one_parent_dispatcher_for_explicit_projects() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let workspace = root.path().join("workspace");
+    let first = workspace.join("resync");
+    let second = workspace.join("resync-hosted");
+    fs::create_dir_all(&first)?;
+    fs::create_dir_all(&second)?;
+    write_json(
+        &state.join("catalog.json"),
+        &LocalCatalog {
+            catalog_generation: 1,
+            projects: vec![
+                local_project("prj_first", first.clone()),
+                local_project("prj_second", second.clone()),
+            ],
+        },
+        0o600,
+    )?;
+    fs::write(
+        workspace.join(".resync-workspace.toml"),
+        r#"version = 1
+
+[[project]]
+path = "resync"
+project_id = "prj_first"
+
+[[project]]
+path = "resync-hosted"
+project_id = "prj_second"
+"#,
+    )?;
+    write_json(
+        &workspace.join(".codex/hooks.json"),
+        &serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{ "type": "command", "command": "echo preserved" }]
+                }]
+            }
+        }),
+        0o644,
+    )?;
+
+    let assertion = Command::cargo_bin("resync")
+        .unwrap()
+        .env("RESYNC_STATE_DIR", &state)
+        .args(["workspace", "install-hooks"])
+        .arg(&workspace)
+        .assert()
+        .success();
+    let output: serde_json::Value = serde_json::from_slice(&assertion.get_output().stdout)?;
+    assert_eq!(output["projectCount"], 2);
+    assert_eq!(output["requiresCodexTrustReview"], true);
+
+    let hooks: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.join(".codex/hooks.json"))?)?;
+    for event in ["PreToolUse", "PostToolUse"] {
+        let commands = hooks["hooks"][event]
+            .as_array()
+            .expect("hook groups")
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
+            .filter_map(|hook| hook["command"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.contains(" codex-workspace-hook "))
+                .count(),
+            1,
+            "one umbrella RepoSync dispatcher per event"
+        );
+        assert!(commands.iter().any(|command| {
+            command.contains(
+                workspace
+                    .join(".resync-workspace.toml")
+                    .to_string_lossy()
+                    .as_ref(),
+            )
+        }));
+    }
+    assert_eq!(
+        hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "echo preserved"
+    );
+    Ok(())
+}
+
+#[test]
+fn workspace_install_hooks_rejects_projects_outside_the_workspace_root() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let workspace = root.path().join("workspace");
+    let outside = root.path().join("outside");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&outside)?;
+    write_json(
+        &state.join("catalog.json"),
+        &LocalCatalog {
+            catalog_generation: 1,
+            projects: vec![local_project("prj_outside", outside)],
+        },
+        0o600,
+    )?;
+    fs::write(
+        workspace.join(".resync-workspace.toml"),
+        r#"version = 1
+
+[[project]]
+path = "../outside"
+project_id = "prj_outside"
+"#,
+    )?;
+
+    Command::cargo_bin("resync")
+        .unwrap()
+        .env("RESYNC_STATE_DIR", &state)
+        .args(["workspace", "install-hooks"])
+        .arg(&workspace)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("escapes the workspace root"));
+    assert!(!workspace.join(".codex/hooks.json").exists());
+    Ok(())
+}

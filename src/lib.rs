@@ -13,5 +13,6 @@ pub mod remote;
 pub mod rpc;
 pub mod state;
 pub mod transaction;
+pub mod workspace;
 
 pub use protocol::{Catalog, CatalogProject, PROTOCOL_VERSION};
