@@ -1006,6 +1006,107 @@ fn safe_hook_part(value: Option<&str>) -> String {
         .collect()
 }
 
+fn hook_command(input: &Value) -> Option<&str> {
+    (input.get("tool_name").and_then(Value::as_str) == Some("Bash"))
+        .then(|| {
+            input
+                .get("tool_input")
+                .and_then(|value| value.get("command"))
+                .and_then(Value::as_str)
+        })
+        .flatten()
+}
+
+fn command_invokes_git(command: &str) -> bool {
+    command
+        .split(|value: char| value.is_whitespace() || ";|&()".contains(value))
+        .map(|value| value.trim_matches(['\'', '"']))
+        .any(|value| value == "git" || value.ends_with("/git"))
+}
+
+fn is_project_sync_command(input: &Value) -> bool {
+    let Some(command) = hook_command(input) else {
+        return false;
+    };
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    words.len() == 3
+        && Path::new(words[0])
+            .file_name()
+            .and_then(|value| value.to_str())
+            == Some("resync")
+        && words[1..] == ["project", "sync"]
+}
+
+fn reconciliation_marker(directory: &Path, project_id: &str) -> PathBuf {
+    directory.join(format!(
+        "reconciliation-{}.json",
+        safe_hook_part(Some(project_id))
+    ))
+}
+
+fn reconciliation_messages(
+    marker: &Path,
+    input: &Value,
+    state: &Value,
+) -> Result<(Option<String>, Option<String>)> {
+    let active = state
+        .get("reconciliation_mode")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if active {
+        let branch = state
+            .get("branch")
+            .and_then(Value::as_str)
+            .unwrap_or("current branch");
+        let remote_ref = state
+            .get("remote_ref")
+            .and_then(Value::as_str)
+            .unwrap_or("the RepoSync remote branch");
+        if !marker.exists() {
+            write_json(
+                marker,
+                &json!({ "branch": branch, "remoteRef": remote_ref }),
+                0o600,
+            )?;
+            let message = format!(
+                "RepoSync entered reconciliation mode after automatic reconciliation failed. Your workspace remains usable, but publication is paused. Reconcile `{branch}` with the latest `{remote_ref}`, then run `resync project sync` to verify the result and leave reconciliation mode."
+            );
+            return Ok((Some(message.clone()), Some(message)));
+        }
+        if hook_command(input).is_some_and(command_invokes_git) {
+            return Ok((
+                None,
+                Some(format!(
+                    "RepoSync reconciliation mode: reconcile against the latest `{remote_ref}`, then run `resync project sync` to verify and exit."
+                )),
+            ));
+        }
+        return Ok((None, None));
+    }
+    if marker.exists() {
+        fs::remove_file(marker)?;
+        let message =
+            "RepoSync reconciliation succeeded. Normal synchronization and publication have resumed."
+                .to_owned();
+        return Ok((Some(message.clone()), Some(message)));
+    }
+    Ok((None, None))
+}
+
+fn hook_output(system_message: Option<String>, additional_context: Option<String>) -> Value {
+    let mut output = json!({});
+    if let Some(message) = system_message {
+        output["systemMessage"] = Value::String(message);
+    }
+    if let Some(context) = additional_context {
+        output["hookSpecificOutput"] = json!({
+            "hookEventName": "PreToolUse",
+            "additionalContext": context
+        });
+    }
+    output
+}
+
 fn codex_hook(project_id: &str) -> Result<Value> {
     let mut source = String::new();
     std::io::stdin()
@@ -1022,17 +1123,25 @@ fn codex_hook(project_id: &str) -> Result<Value> {
         "{}.json",
         safe_hook_part(input.get("tool_use_id").and_then(Value::as_str))
     ));
+    let mode_marker = reconciliation_marker(&directory, project_id);
     match input.get("hook_event_name").and_then(Value::as_str) {
+        Some("PreToolUse") if is_project_sync_command(&input) => {
+            match daemon_rpc(&json!({ "method": "accessState", "project_id": project_id })) {
+                Ok(state) => {
+                    fs::create_dir_all(&directory)?;
+                    let (system_message, additional_context) =
+                        reconciliation_messages(&mode_marker, &input, &state)?;
+                    Ok(hook_output(system_message, additional_context))
+                }
+                Err(error) => Ok(json!({
+                    "systemMessage": format!("RepoSync state is unavailable; the tool call will continue: {error:#}")
+                })),
+            }
+        }
         Some("PreToolUse") => match daemon_rpc(&json!({
             "method": "acquireAccess", "project_id": project_id, "session_id": input.get("session_id"),
             "call_id": input.get("tool_use_id"), "access_hint": "unknown"
         })) {
-            Ok(result) if result.get("blocked").and_then(Value::as_bool) == Some(true) => {
-                Ok(json!({ "hookSpecificOutput": {
-                "hookEventName": "PreToolUse", "permissionDecision": "deny",
-                "permissionDecisionReason": result.get("model_message").and_then(Value::as_str).unwrap_or("RepoSync blocked the workspace")
-            } }))
-            }
             Ok(result) => {
                 fs::create_dir_all(&directory)?;
                 write_json(
@@ -1042,27 +1151,52 @@ fn codex_hook(project_id: &str) -> Result<Value> {
                     }),
                     0o600,
                 )?;
-                Ok(
-                    json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": result.get("model_message") } }),
-                )
+                let (system_message, mode_context) =
+                    reconciliation_messages(&mode_marker, &input, &result)?;
+                let normal_context = result
+                    .get("model_message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                Ok(hook_output(system_message, mode_context.or(normal_context)))
             }
-            Err(error) => Ok(json!({ "hookSpecificOutput": {
-                "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": format!("RepoSync access barrier failed: {error:#}")
-            } })),
+            Err(error) => Ok(json!({
+                "systemMessage": format!("RepoSync access coordination is unavailable; the tool call will continue: {error:#}")
+            })),
         },
-        Some("PostToolUse") => match (|| -> Result<()> {
-            let lease: Value = serde_json::from_slice(&fs::read(&lease_path)?)?;
-            daemon_rpc(
-                &json!({ "method": "releaseAccess", "lease_id": lease.get("leaseId"), "outcome": "success", "mutation_hint": "possible" }),
-            )?;
-            fs::remove_file(lease_path)?;
-            Ok(())
-        })() {
-            Ok(()) => Ok(json!({})),
-            Err(error) => Ok(
-                json!({ "systemMessage": format!("RepoSync could not release the tool lease: {error:#}") }),
-            ),
-        },
+        Some("PostToolUse") if is_project_sync_command(&input) => {
+            match daemon_rpc(&json!({ "method": "accessState", "project_id": project_id })) {
+                Ok(state) => {
+                    let (system_message, additional_context) =
+                        reconciliation_messages(&mode_marker, &input, &state)?;
+                    let mut output = hook_output(system_message, additional_context);
+                    if let Some(value) = output.get_mut("hookSpecificOutput") {
+                        value["hookEventName"] = Value::String("PostToolUse".into());
+                    }
+                    Ok(output)
+                }
+                Err(error) => Ok(json!({
+                    "systemMessage": format!("RepoSync could not verify reconciliation state: {error:#}")
+                })),
+            }
+        }
+        Some("PostToolUse") => {
+            if !lease_path.exists() {
+                return Ok(json!({}));
+            }
+            match (|| -> Result<()> {
+                let lease: Value = serde_json::from_slice(&fs::read(&lease_path)?)?;
+                daemon_rpc(
+                    &json!({ "method": "releaseAccess", "lease_id": lease.get("leaseId"), "outcome": "success", "mutation_hint": "possible" }),
+                )?;
+                fs::remove_file(lease_path)?;
+                Ok(())
+            })() {
+                Ok(()) => Ok(json!({})),
+                Err(error) => Ok(
+                    json!({ "systemMessage": format!("RepoSync could not release the tool lease: {error:#}") }),
+                ),
+            }
+        }
         _ => Ok(json!({})),
     }
 }
@@ -1089,7 +1223,10 @@ fn absolute(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::join_destination;
+    use super::{
+        command_invokes_git, is_project_sync_command, join_destination, reconciliation_messages,
+    };
+    use serde_json::json;
 
     #[test]
     fn explicit_join_path_does_not_require_a_git_worktree() -> anyhow::Result<()> {
@@ -1098,6 +1235,71 @@ mod tests {
         assert_eq!(
             join_destination(Some(&destination), outside_git.path())?,
             destination
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_git_and_the_exact_reconciliation_command() {
+        assert!(command_invokes_git("git status --short"));
+        assert!(command_invokes_git(
+            "cd repo && /usr/bin/git rebase resync/main"
+        ));
+        assert!(!command_invokes_git("cargo test"));
+        assert!(is_project_sync_command(&json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "resync project sync" }
+        })));
+        assert!(!is_project_sync_command(&json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "git status && resync project sync" }
+        })));
+    }
+
+    #[test]
+    fn reconciliation_messages_enter_remind_and_exit_once() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let marker = directory.path().join("mode.json");
+        let state = json!({
+            "reconciliation_mode": true,
+            "branch": "main",
+            "remote_ref": "resync/main"
+        });
+        let git_input = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "git status" }
+        });
+
+        let (system, context) = reconciliation_messages(&marker, &git_input, &state)?;
+        let entry = system.as_deref().unwrap();
+        assert!(entry.contains("entered reconciliation mode"));
+        assert!(entry.contains("`resync project sync`"));
+        assert_eq!(context.as_deref(), Some(entry));
+
+        let (system, context) = reconciliation_messages(&marker, &git_input, &state)?;
+        assert_eq!(system, None);
+        let reminder = context.as_deref().unwrap();
+        assert!(reminder.starts_with("RepoSync reconciliation mode:"));
+        assert!(reminder.contains("`resync project sync`"));
+        assert!(reminder.len() < entry.len());
+
+        let non_git_input = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "cargo test" }
+        });
+        assert_eq!(
+            reconciliation_messages(&marker, &non_git_input, &state)?,
+            (None, None)
+        );
+
+        let cleared = json!({ "reconciliation_mode": false });
+        let (system, context) = reconciliation_messages(&marker, &non_git_input, &cleared)?;
+        let exit = system.as_deref().unwrap();
+        assert!(exit.contains("reconciliation succeeded"));
+        assert_eq!(context.as_deref(), Some(exit));
+        assert_eq!(
+            reconciliation_messages(&marker, &non_git_input, &cleared)?,
+            (None, None)
         );
         Ok(())
     }

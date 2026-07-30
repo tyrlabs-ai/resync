@@ -1,6 +1,6 @@
 mod common;
 
-use common::{fixture, rev};
+use common::{advance_remote, fixture, rev};
 use resync::daemon::ResyncDaemon;
 use resync::process::{RunOptions, git};
 use resync::remote::fetch_remote;
@@ -11,6 +11,97 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
+
+#[test]
+fn failed_automatic_reconciliation_grants_access_until_explicit_sync() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    fs::write(fixture.local.join("file"), "local\n")?;
+    let target = advance_remote(&fixture, "remote\n")?;
+    let project = LocalProject {
+        project_id: "prj_reconciliation_mode".into(),
+        local_path: fixture.local.clone(),
+        remote_url: fixture.remote.to_string_lossy().into_owned(),
+        remote_name: "origin".into(),
+        default_branch: "main".into(),
+        server_generation: 1,
+        advertised_heads: BTreeMap::from([("main".into(), target)]),
+        last_applied_heads: BTreeMap::from([("main".into(), fixture.base)]),
+        active_branch: Some("main".into()),
+        workspace_generation: 1,
+        state: "REMOTE_AHEAD".into(),
+        durability: "DIRTY_UNCHECKPOINTED".into(),
+        conflict: None,
+        last_error: None,
+        service: None,
+        checkout_id: None,
+        extra: BTreeMap::new(),
+    };
+    let root = fixture.root.path().join("state");
+    let paths = StatePaths {
+        config: root.join("config.json"),
+        credentials: root.join("credentials.json"),
+        keys: root.join("keys"),
+        catalog: root.join("catalog.json"),
+        transactions: root.join("transactions"),
+        daemon_lock: root.join("daemon.lock"),
+        socket: root.join("daemon.sock"),
+        root,
+    };
+    let daemon = ResyncDaemon::from_parts(
+        paths.clone(),
+        Config::default(),
+        LocalCatalog {
+            catalog_generation: 1,
+            projects: vec![project],
+        },
+        Duration::from_secs(10),
+        Duration::from_secs(60),
+    )?;
+    let runtime = resync::daemon::runtime()?;
+    runtime.block_on(async {
+        for call in ["first", "second"] {
+            let access = daemon
+                .handle(serde_json::json!({
+                    "method": "acquireAccess",
+                    "project_id": "prj_reconciliation_mode",
+                    "session_id": "session",
+                    "call_id": call
+                }))
+                .await?;
+            assert_eq!(access["granted"], true);
+            assert_eq!(access["reconciliation_mode"], true);
+            assert_eq!(fs::read_to_string(fixture.local.join("file"))?, "local\n");
+            daemon
+                .handle(serde_json::json!({
+                    "method": "releaseAccess",
+                    "lease_id": access["lease_id"]
+                }))
+                .await?;
+        }
+        assert_eq!(fs::read_dir(&paths.transactions)?.count(), 1);
+
+        git(
+            &fixture.local,
+            ["reset", "--hard", "origin/main"],
+            RunOptions::default(),
+        )?;
+        let result = daemon
+            .handle(serde_json::json!({
+                "method": "sync",
+                "project_id": "prj_reconciliation_mode"
+            }))
+            .await?;
+        assert_eq!(result["outcome"], "current");
+        let state = daemon
+            .handle(serde_json::json!({
+                "method": "accessState",
+                "project_id": "prj_reconciliation_mode"
+            }))
+            .await?;
+        assert_eq!(state["reconciliation_mode"], false);
+        anyhow::Ok(())
+    })
+}
 
 #[test]
 fn idle_reconciliation_applies_only_current_branch() -> anyhow::Result<()> {
@@ -163,8 +254,34 @@ fn current_reconciliation_clears_stale_conflict() -> anyhow::Result<()> {
     )?;
     let runtime = resync::daemon::runtime()?;
     runtime.block_on(async {
+        let access = daemon
+            .handle(serde_json::json!({
+                "method": "acquireAccess",
+                "project_id": "prj_stale_conflict",
+                "session_id": "session",
+                "call_id": "call"
+            }))
+            .await?;
+        assert_eq!(access["granted"], true);
+        assert_eq!(access["reconciliation_mode"], true);
+        let lease = access["lease_id"].as_str().unwrap();
+        daemon
+            .handle(serde_json::json!({
+                "method": "releaseAccess",
+                "lease_id": lease
+            }))
+            .await?;
         assert_eq!(
-            daemon.reconcile_now("prj_stale_conflict").await?.outcome,
+            daemon.project_snapshot("prj_stale_conflict").await?.state,
+            "CONFLICTED"
+        );
+        assert_eq!(
+            daemon
+                .handle(serde_json::json!({
+                    "method": "sync",
+                    "project_id": "prj_stale_conflict"
+                }))
+                .await?["outcome"],
             "current"
         );
         let snapshot = daemon.project_snapshot("prj_stale_conflict").await?;
@@ -256,6 +373,22 @@ fn missing_provider_membership_becomes_access_lost() -> anyhow::Result<()> {
                 .unwrap()
                 .contains("no longer authorizes")
         );
+        let access = daemon
+            .handle(serde_json::json!({
+                "method": "acquireAccess",
+                "project_id": "prj_access_lost",
+                "session_id": "session",
+                "call_id": "call"
+            }))
+            .await?;
+        assert_eq!(access["granted"], true);
+        assert_eq!(access["reconciliation_mode"], false);
+        daemon
+            .handle(serde_json::json!({
+                "method": "releaseAccess",
+                "lease_id": access["lease_id"]
+            }))
+            .await?;
         anyhow::Ok(())
     })?;
     server.join().unwrap()?;

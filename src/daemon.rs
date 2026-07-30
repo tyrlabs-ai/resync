@@ -469,34 +469,30 @@ impl ResyncDaemon {
     async fn acquire(&self, request: &Value) -> Result<Value> {
         let project_id = string_field(request, "project_id")?;
         self.ensure_branch_transition(project_id).await?;
-        {
+        let should_reconcile = {
             let catalog = self.inner.catalog.lock().await;
             let project = find_project(&catalog, project_id)?;
-            if matches!(
+            matches!(
                 project.state.as_str(),
-                "CONFLICTED" | "FAILED" | "ACCESS_LOST"
-            ) {
-                return Ok(blocked(project));
-            }
-        }
-        let gate = self.gate(project_id);
-        gate.begin_exclusive().await;
-        let reconciliation = {
-            let mut catalog = self.inner.catalog.lock().await;
-            let project = find_project_mut(&mut catalog, project_id)?;
-            let result = self.reconcile_project(project);
-            self.persist(&catalog).await?;
-            result
+                "REMOTE_AHEAD" | "WAITING_FOR_LEASES" | "RECONCILING"
+            )
         };
-        gate.end_exclusive().await;
-        let reconciliation = reconciliation?;
-        {
-            let catalog = self.inner.catalog.lock().await;
-            let project = find_project(&catalog, project_id)?;
-            if project.state == "CONFLICTED" {
-                return Ok(blocked(project));
+        let gate = self.gate(project_id);
+        let reconciliation = if should_reconcile {
+            gate.begin_exclusive().await;
+            let result = async {
+                let mut catalog = self.inner.catalog.lock().await;
+                let project = find_project_mut(&mut catalog, project_id)?;
+                let result = self.reconcile_project(project);
+                self.persist(&catalog).await?;
+                result
             }
-        }
+            .await;
+            gate.end_exclusive().await;
+            result?
+        } else {
+            simple_outcome("deferred")
+        };
         let lease_id = gate
             .activity(json!({
                 "sessionId": request.get("session_id"), "callId": request.get("call_id")
@@ -510,9 +506,16 @@ impl ResyncDaemon {
         let catalog = self.inner.catalog.lock().await;
         let project = find_project(&catalog, project_id)?;
         let head = capture_workspace(&project.local_path)?.head;
+        let branch = project
+            .active_branch
+            .as_deref()
+            .unwrap_or(&project.default_branch);
         Ok(json!({
             "granted": true, "lease_id": lease_id, "workspace_generation": project.workspace_generation,
             "branch_oid": head, "reconciliation": if reconciliation.outcome == "applied" { "applied" } else { "none" },
+            "reconciliation_mode": project.state == "CONFLICTED",
+            "branch": branch,
+            "remote_ref": format!("{}/{}", project.remote_name, branch),
             "changed_paths_summary": reconciliation.changed_paths.iter().take(50).collect::<Vec<_>>(),
             "model_message": (reconciliation.outcome == "applied").then(|| format!(
                 "RepoSync advanced the workspace and preserved local work. Upstream changed: {}.",
@@ -694,6 +697,9 @@ impl ResyncDaemon {
                 let catalog = self.inner.catalog.lock().await;
                 find_project(&catalog, &publication.project_id)?.clone()
             };
+            if project.state == "CONFLICTED" {
+                bail!("publication is paused until `resync project sync` completes reconciliation");
+            }
             let remote_head = fetch_remote_branch(
                 &project,
                 &publication.branch,
@@ -1079,6 +1085,21 @@ impl ResyncDaemon {
                 Ok(json!({ "projects": projects }))
             }
             "acquireAccess" => self.acquire(&request).await,
+            "accessState" => {
+                let project_id = string_field(&request, "project_id")?;
+                let catalog = self.inner.catalog.lock().await;
+                let project = find_project(&catalog, project_id)?;
+                let branch = project
+                    .active_branch
+                    .as_deref()
+                    .unwrap_or(&project.default_branch);
+                Ok(json!({
+                    "state": project.state.to_lowercase(),
+                    "reconciliation_mode": project.state == "CONFLICTED",
+                    "branch": branch,
+                    "remote_ref": format!("{}/{}", project.remote_name, branch)
+                }))
+            }
             "releaseAccess" => self.release(&request).await,
             "sync" => self.sync(&request).await,
             "publish" => self.publish(&request).await,
@@ -1191,14 +1212,6 @@ fn simple_outcome(outcome: &str) -> ReconcileResult {
         detail: None,
         paths: Vec::new(),
     }
-}
-
-fn blocked(project: &LocalProject) -> Value {
-    json!({
-        "blocked": true, "state": project.state.to_lowercase(),
-        "model_message": project.conflict.as_ref().map(|value| value.detail.clone()).or(project.last_error.clone()).unwrap_or_else(|| "workspace unavailable".into()),
-        "recovery_actions": ["resync conflicts", "resync recover"]
-    })
 }
 
 fn acquire_process_lock(paths: &StatePaths) -> Result<()> {

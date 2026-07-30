@@ -82,7 +82,7 @@ lease_json="$(resync acquire PROJECT_ID SESSION_ID CALL_ID)"
 resync release LEASE_ID
 ```
 
-Ordinary `git commit` is the publication trigger; no RepoSync command is needed afterward. Use `resync sync PROJECT_ID` for an explicit compatibility-mode barrier and `resync publish PROJECT_ID` only to retry or flush publication manually. The daemon's Unix socket is mode `0600`; its state defaults to `~/.local/state/resync` and can be redirected with `RESYNC_STATE_DIR`.
+Ordinary `git commit` is the publication trigger; no RepoSync command is needed afterward. Use `resync project sync` to verify and leave reconciliation mode and `resync project publish` only to retry or flush publication manually. The daemon's Unix socket is mode `0600`; its state defaults to `~/.local/state/resync` and can be redirected with `RESYNC_STATE_DIR`.
 
 Propagation is symmetric: a commit made in any enrolled checkout is published
 to its branch and fetched by every running machine daemon. An idle checkout is
@@ -90,7 +90,7 @@ reconciled immediately in the background. If a participating tool call is
 active, installation waits for its lease to end and completes before another
 call is admitted.
 
-Enrollment automatically installs the bundled RepoSync skill at `.agents/skills/reposync`, merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json`, and installs a chainable, signal-only Git `post-commit` hook. `install-adapters` remains available as a repair command. A hook starts the daemon if necessary, so a commit notification is not lost merely because no daemon process was already running. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. The pre-tool hook denies a local tool call if the access barrier cannot be reached, while the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
+Enrollment automatically installs the bundled RepoSync skill at `.agents/skills/reposync`, merges project-local `PreToolUse` and `PostToolUse` entries into `.codex/hooks.json`, and installs a chainable, signal-only Git `post-commit` hook. `install-adapters` remains available as a repair command. A hook starts the daemon if necessary, so a commit notification is not lost merely because no daemon process was already running. Codex project hooks run only for trusted projects and new or changed hooks require review; open `/hooks` in Codex and inspect the definitions before trusting them. The pre-tool hook coordinates an activity lease when RepoSync is available and otherwise lets the tool continue with a warning; the post-tool hook releases the exact `tool_use_id` lease. Hosted tool paths that Codex does not expose to local hooks do not touch the worktree and are outside this lease boundary.
 
 ## Correctness boundary
 
@@ -98,6 +98,7 @@ Enrollment automatically installs the bundled RepoSync skill at `.agents/skills/
 - A participating call holds a shared activity lease. Reconciliation holds an exclusive lease.
 - Dirty tracked state is represented as two private synthetic commits, rebased in an isolated worktree, and installed only after the original workspace snapshot is reverified.
 - A failed rebase leaves the active branch, index, and working tree unchanged and retains recovery refs under `refs/resync/recovery/`.
+- A failed automatic rebase enters non-blocking reconciliation mode. Publication pauses, Git commands receive a concise reminder, and `resync project sync` explicitly verifies the resolution and exits the mode.
 - Publication uses normal, non-forced pushes. A rejected push triggers fetch/rebase/revalidate/retry.
 - Every `refs/heads/*` branch is transported and protected independently. Fetching an inactive branch updates its remote-tracking ref without changing the worktree; reconciliation occurs when that branch is checked out.
 - Detached processes, editors, and tools that bypass leases are unmanaged. Release builds belong in an immutable checkout or CI.

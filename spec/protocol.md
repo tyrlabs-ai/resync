@@ -139,7 +139,7 @@ The daemon listens on a mode-`0600` Unix socket and exchanges newline-delimited 
 {"method":"acquireAccess","project_id":"prj_example","session_id":"s1","call_id":"c1","observed_generation":3,"access_hint":"unknown"}
 ```
 
-A grant contains `lease_id`, `workspace_generation`, `branch_oid`, `reconciliation`, an optional path summary, and an optional model-visible message. A blocked response contains `state`, `model_message`, and `recovery_actions`.
+A grant contains `lease_id`, `workspace_generation`, `branch_oid`, `reconciliation`, reconciliation-mode state, an optional path summary, and an optional model-visible message. Reconciliation, connectivity, authorization, and daemon failures MUST NOT turn the workspace-access adapter into a persistent denial surface; the adapter surfaces a warning and leaves the prior coherent workspace available.
 
 Release uses `releaseAccess` with the lease ID and outcome. Other V1 methods are
 `status`, `sync`, `publish`, `reportCommit`, `reportCheckout`, and `ping`. A

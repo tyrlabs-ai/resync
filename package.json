@@ -1,6 +1,6 @@
 {
   "name": "@tyrlabs-ai/resync",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Open protocol and cooperative Git synchronization daemon for coding agents",
   "type": "module",
   "files": [
@@ -11,10 +11,10 @@
     "resync": "./bin/resync.js"
   },
   "optionalDependencies": {
-    "@tyrlabs-ai/resync-darwin-arm64": "0.3.0",
-    "@tyrlabs-ai/resync-darwin-x64": "0.3.0",
-    "@tyrlabs-ai/resync-linux-arm64": "0.3.0",
-    "@tyrlabs-ai/resync-linux-x64": "0.3.0"
+    "@tyrlabs-ai/resync-darwin-arm64": "0.3.1",
+    "@tyrlabs-ai/resync-darwin-x64": "0.3.1",
+    "@tyrlabs-ai/resync-linux-arm64": "0.3.1",
+    "@tyrlabs-ai/resync-linux-x64": "0.3.1"
   },
   "engines": {
     "node": ">=18"

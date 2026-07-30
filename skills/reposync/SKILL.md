@@ -23,6 +23,14 @@ Use `resync <ssh-target>` to enroll another SSH machine into the same project th
 
 Use `resync -h` and the `-h` or `--help` option at any command level to inspect the installed CLI rather than guessing an option.
 
+## Reconciliation mode
+
+If RepoSync reports reconciliation mode, the workspace remains available but
+publication is paused. Reconcile the current branch with the latest RepoSync
+remote-tracking branch, then run `resync project sync`. Do not repeatedly retry
+automatic reconciliation after ordinary file edits; the explicit sync command
+verifies the result and leaves reconciliation mode only on success.
+
 ## RepoSync commit cadence
 
 RepoSync propagates committed Git history. Commit after completing and testing
