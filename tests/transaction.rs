@@ -5,6 +5,8 @@ use resync::git_state::capture_workspace;
 use resync::process::{RunOptions, git};
 use resync::transaction::reconcile_workspace;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn clean_reconciliation_preserves_staged_and_unstaged_layers() -> anyhow::Result<()> {
@@ -27,6 +29,34 @@ fn clean_reconciliation_preserves_staged_and_unstaged_layers() -> anyhow::Result
     );
     let staged = git(&fixture.local, ["show", ":local"], RunOptions::default())?.stdout;
     assert_eq!(staged, "staged\n");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn internal_candidate_checkout_does_not_run_project_hooks() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let marker = fixture.root.path().join("post-checkout-ran");
+    let hook = fixture.local.join(".git/hooks/post-checkout");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\nprintf ran > \"{}\"\n", marker.display()),
+    )?;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+
+    let target = advance_remote(&fixture, "remote\n")?;
+    let result = reconcile_workspace(
+        &fixture.local,
+        &fixture.base,
+        &target,
+        Some(&fixture.root.path().join("transactions")),
+    )?;
+
+    assert_eq!(result.outcome, "applied");
+    assert!(
+        !marker.exists(),
+        "RepoSync's internal candidate checkout invoked the project's post-checkout hook"
+    );
     Ok(())
 }
 

@@ -262,6 +262,8 @@ pub fn reconcile_workspace(
         git(
             project_path,
             [
+                "-c",
+                "core.hooksPath=/dev/null",
                 "worktree",
                 "add",
                 "--detach",
@@ -272,7 +274,7 @@ pub fn reconcile_workspace(
         )?;
         git(
             temporary_path,
-            ["switch", "-c", &branch],
+            ["-c", "core.hooksPath=/dev/null", "switch", "-c", &branch],
             RunOptions::default(),
         )?;
         let mut options = RunOptions {
@@ -290,6 +292,8 @@ pub fn reconcile_workspace(
         let result = git(
             temporary_path,
             [
+                "-c",
+                "core.hooksPath=/dev/null",
                 "rebase",
                 "--keep-empty",
                 "--onto",
@@ -304,7 +308,11 @@ pub fn reconcile_workspace(
                 allow_failure: true,
                 ..RunOptions::default()
             };
-            git(temporary_path, ["rebase", "--abort"], abort)?;
+            git(
+                temporary_path,
+                ["-c", "core.hooksPath=/dev/null", "rebase", "--abort"],
+                abort,
+            )?;
             let detail: String = result
                 .stderr
                 .chars()
