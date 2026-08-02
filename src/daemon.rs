@@ -11,7 +11,10 @@ use crate::state::{
     Config, LocalCatalog, LocalProject, StatePaths, load_catalog, read_json, state_paths,
     write_json,
 };
-use crate::transaction::{ReconcileResult, reconcile_workspace};
+use crate::transaction::{
+    ReconcileResult, clear_resolved_conflicts, reconcile_workspace_with_retention,
+    transaction_retention,
+};
 use anyhow::{Context, Result, bail};
 use rand::Rng;
 use serde_json::{Value, json};
@@ -359,6 +362,7 @@ impl ResyncDaemon {
     }
 
     fn reconcile_project(&self, project: &mut LocalProject) -> Result<ReconcileResult> {
+        let retention = transaction_retention(&self.inner.paths.root);
         let branch = current_branch(&project.local_path).map_err(|_| {
             anyhow::anyhow!("detached or unborn HEAD is unsupported in RepoSync V1")
         })?;
@@ -366,6 +370,11 @@ impl ResyncDaemon {
         let Some(target) = project.advertised_heads.get(&branch).cloned() else {
             project.state = "CURRENT".into();
             project.conflict = None;
+            clear_resolved_conflicts(
+                &self.inner.paths.transactions,
+                &project.local_path,
+                retention,
+            )?;
             return Ok(simple_outcome("current"));
         };
         let snapshot = capture_workspace(&project.local_path)?;
@@ -373,6 +382,11 @@ impl ResyncDaemon {
             project.last_applied_heads.insert(branch, target);
             project.state = "CURRENT".into();
             project.conflict = None;
+            clear_resolved_conflicts(
+                &self.inner.paths.transactions,
+                &project.local_path,
+                retention,
+            )?;
             return Ok(simple_outcome("current"));
         }
         let target_is_base = is_ancestor(&project.local_path, &target, &snapshot.head)?;
@@ -380,6 +394,11 @@ impl ResyncDaemon {
             project.last_applied_heads.insert(branch, target);
             project.state = "CURRENT".into();
             project.conflict = None;
+            clear_resolved_conflicts(
+                &self.inner.paths.transactions,
+                &project.local_path,
+                retention,
+            )?;
             return Ok(simple_outcome("current"));
         }
         let head_is_base = is_ancestor(&project.local_path, &snapshot.head, &target)?;
@@ -403,17 +422,23 @@ impl ResyncDaemon {
             }
         }
         project.state = "RECONCILING".into();
-        let result = reconcile_workspace(
+        let result = reconcile_workspace_with_retention(
             &project.local_path,
             previous.as_deref().unwrap(),
             &target,
             Some(&self.inner.paths.transactions),
+            retention,
         )?;
         if result.outcome == "applied" {
             project.last_applied_heads.insert(branch, target);
             project.workspace_generation += 1;
             project.state = "CURRENT".into();
             project.conflict = None;
+            clear_resolved_conflicts(
+                &self.inner.paths.transactions,
+                &project.local_path,
+                retention,
+            )?;
         } else if result.outcome == "conflict" {
             project.state = "CONFLICTED".into();
             project.conflict = Some(crate::state::Conflict {

@@ -7,6 +7,8 @@ use crate::state::{state_paths, write_json};
 use anyhow::{Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
@@ -51,6 +53,282 @@ pub struct Transaction {
     pub completed_at: Option<String>,
     #[serde(default)]
     pub recovered_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransactionRetention {
+    pub debug_history: bool,
+}
+
+pub const DEBUG_HISTORY_MAX_RECORDS: usize = 128;
+pub const DEBUG_HISTORY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+pub fn transaction_retention(state_root: &Path) -> TransactionRetention {
+    TransactionRetention {
+        debug_history: state_root.join("transaction-debug").is_file(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionGcReport {
+    pub dry_run: bool,
+    pub debug_history: bool,
+    pub scanned: usize,
+    pub retained: usize,
+    pub removed: usize,
+    pub compacted: usize,
+    pub invalid_retained: usize,
+    pub recovery_refs_prunable: usize,
+    pub recovery_refs_removed: usize,
+    pub recovery_refs_skipped: usize,
+    pub bytes_reclaimed: u64,
+}
+
+struct GcEntry {
+    transaction: Transaction,
+    original_bytes: u64,
+    compact_bytes: u64,
+    retain: bool,
+}
+
+pub fn gc_transactions(
+    root: &Path,
+    managed_project_paths: &BTreeSet<PathBuf>,
+    active_conflict_paths: &BTreeSet<PathBuf>,
+    retention: TransactionRetention,
+    dry_run: bool,
+) -> Result<TransactionGcReport> {
+    let mut entries = Vec::new();
+    let mut scanned = 0;
+    let mut invalid_retained = 0;
+    if let Ok(directory) = fs::read_dir(root) {
+        for entry in directory {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            scanned += 1;
+            let contents = fs::read(&path)?;
+            let Ok(mut transaction) = serde_json::from_slice::<Transaction>(&contents) else {
+                invalid_retained += 1;
+                continue;
+            };
+            transaction.path = path;
+            let compact_bytes = serde_json::to_vec_pretty(&transaction)?.len() as u64 + 1;
+            let retain = transaction.phase == "INSTALLING"
+                || (transaction.phase == "CONFLICTED"
+                    && active_conflict_paths.contains(&transaction.project_path));
+            entries.push(GcEntry {
+                transaction,
+                original_bytes: contents.len() as u64,
+                compact_bytes,
+                retain,
+            });
+        }
+    }
+
+    if retention.debug_history {
+        let mut history = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !entry.retain)
+            .map(|(index, entry)| (index, entry.transaction.created_at.clone()))
+            .collect::<Vec<_>>();
+        history.sort_by(|left, right| right.1.cmp(&left.1));
+        let mut retained_records = 0;
+        let mut retained_bytes = 0_u64;
+        for (index, _) in history {
+            let entry = &mut entries[index];
+            if retained_records < DEBUG_HISTORY_MAX_RECORDS
+                && retained_bytes.saturating_add(entry.compact_bytes) <= DEBUG_HISTORY_MAX_BYTES
+            {
+                entry.retain = true;
+                retained_records += 1;
+                retained_bytes += entry.compact_bytes;
+            }
+        }
+    }
+
+    let retained = entries.iter().filter(|entry| entry.retain).count() + invalid_retained;
+    let removed = entries.iter().filter(|entry| !entry.retain).count();
+    let compacted = entries
+        .iter()
+        .filter(|entry| entry.retain && entry.compact_bytes < entry.original_bytes)
+        .count();
+    let bytes_reclaimed = entries
+        .iter()
+        .map(|entry| {
+            if entry.retain {
+                entry.original_bytes.saturating_sub(entry.compact_bytes)
+            } else {
+                entry.original_bytes
+            }
+        })
+        .sum();
+
+    let mut project_paths = managed_project_paths.clone();
+    let mut required_refs = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+    for entry in &entries {
+        project_paths.insert(entry.transaction.project_path.clone());
+        if !entry.retain {
+            continue;
+        }
+        validate_recovery_ref(&entry.transaction.recovery_ref)?;
+        for suffix in ["head", "index", "working"] {
+            required_refs
+                .entry(entry.transaction.project_path.clone())
+                .or_default()
+                .insert(format!("{}/{suffix}", entry.transaction.recovery_ref));
+        }
+    }
+    let mut prunable_refs = BTreeMap::<PathBuf, Vec<String>>::new();
+    let mut recovery_refs_skipped = 0;
+    for project_path in project_paths {
+        let Some(actual_refs) = list_recovery_refs(&project_path)? else {
+            continue;
+        };
+        let required = required_refs.get(&project_path);
+        let unneeded = actual_refs
+            .into_iter()
+            .filter(|reference| required.is_none_or(|refs| !refs.contains(reference)))
+            .collect::<Vec<_>>();
+        if invalid_retained == 0 {
+            if !unneeded.is_empty() {
+                prunable_refs.insert(project_path, unneeded);
+            }
+        } else {
+            recovery_refs_skipped += unneeded.len();
+        }
+    }
+    let recovery_refs_prunable = prunable_refs.values().map(Vec::len).sum();
+    let mut recovery_refs_removed = 0;
+    if !dry_run {
+        for (project_path, references) in prunable_refs {
+            delete_recovery_refs_batch(&project_path, &references)?;
+            recovery_refs_removed += references.len();
+            remove_empty_recovery_directories(&project_path)?;
+        }
+
+        for entry in &entries {
+            if entry.retain {
+                if entry.compact_bytes < entry.original_bytes {
+                    write_json(&entry.transaction.path, &entry.transaction, 0o600)?;
+                }
+            } else {
+                match fs::remove_file(&entry.transaction.path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+
+    Ok(TransactionGcReport {
+        dry_run,
+        debug_history: retention.debug_history,
+        scanned,
+        retained,
+        removed,
+        compacted,
+        invalid_retained,
+        recovery_refs_prunable,
+        recovery_refs_removed,
+        recovery_refs_skipped,
+        bytes_reclaimed,
+    })
+}
+
+fn delete_recovery_refs_batch(project_path: &Path, references: &[String]) -> Result<()> {
+    let mut input = String::from("start\n");
+    for reference in references {
+        validate_recovery_ref(reference)?;
+        writeln!(input, "delete {reference}")?;
+    }
+    input.push_str("prepare\ncommit\n");
+    git(
+        project_path,
+        ["update-ref", "--stdin"],
+        RunOptions {
+            input: Some(input.into_bytes()),
+            ..RunOptions::default()
+        },
+    )?;
+    Ok(())
+}
+
+fn validate_recovery_ref(reference: &str) -> Result<()> {
+    if !reference.starts_with("refs/resync/recovery/")
+        || reference.chars().any(|character| character.is_whitespace())
+    {
+        bail!("refusing to operate on invalid recovery ref {reference}");
+    }
+    Ok(())
+}
+
+fn list_recovery_refs(project_path: &Path) -> Result<Option<Vec<String>>> {
+    let output = match git(
+        project_path,
+        [
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/resync/recovery",
+        ],
+        RunOptions {
+            allow_failure: true,
+            ..RunOptions::default()
+        },
+    ) {
+        Ok(output) if output.code == 0 => output,
+        Ok(_) | Err(_) => return Ok(None),
+    };
+    Ok(Some(
+        output
+            .stdout
+            .lines()
+            .filter(|reference| !reference.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    ))
+}
+
+fn remove_empty_recovery_directories(project_path: &Path) -> Result<()> {
+    let output = git(
+        project_path,
+        [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "refs/resync/recovery",
+        ],
+        RunOptions::default(),
+    )?;
+    let root = PathBuf::from(output.stdout.trim());
+    let Ok(_) = fs::read_dir(&root) else {
+        return Ok(());
+    };
+    let mut directories = Vec::new();
+    let mut pending = vec![root.clone()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path.clone());
+                directories.push(path);
+            }
+        }
+    }
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        match fs::remove_dir(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,10 +402,106 @@ fn write_recovery_refs(
     Ok(prefix)
 }
 
+fn delete_recovery_refs(project_path: &Path, prefix: &str) -> Result<()> {
+    for suffix in ["head", "index", "working"] {
+        git(
+            project_path,
+            ["update-ref", "-d", &format!("{prefix}/{suffix}")],
+            RunOptions::default(),
+        )?;
+    }
+    Ok(())
+}
+
+fn remove_transaction_artifacts(transaction: &Transaction) -> Result<()> {
+    delete_recovery_refs(&transaction.project_path, &transaction.recovery_ref)?;
+    match fs::remove_file(&transaction.path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn persist_debug_transaction(transaction: &Transaction) -> Result<()> {
+    write_json(&transaction.path, transaction, 0o600)?;
+    prune_debug_history(
+        transaction.path.parent().unwrap_or_else(|| Path::new(".")),
+        Some(&transaction.id),
+    )
+}
+
+fn prune_debug_history(root: &Path, protected_id: Option<&str>) -> Result<()> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Ok(());
+    };
+    let mut history = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Ok(transaction) = serde_json::from_slice::<Transaction>(&fs::read(&path)?) else {
+            continue;
+        };
+        if matches!(transaction.phase.as_str(), "INSTALLING" | "CONFLICTED")
+            || protected_id == Some(transaction.id.as_str())
+        {
+            continue;
+        }
+        history.push((
+            transaction.created_at.clone(),
+            fs::metadata(&path)?.len(),
+            transaction,
+        ));
+    }
+    history.sort_by(|left, right| right.0.cmp(&left.0));
+
+    let protected_count = usize::from(protected_id.is_some());
+    let mut retained_count = protected_count;
+    let mut retained_bytes = 0_u64;
+    for (_, bytes, transaction) in history {
+        if retained_count < DEBUG_HISTORY_MAX_RECORDS
+            && retained_bytes.saturating_add(bytes) <= DEBUG_HISTORY_MAX_BYTES
+        {
+            retained_count += 1;
+            retained_bytes += bytes;
+        } else {
+            remove_transaction_artifacts(&transaction)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn clear_resolved_conflicts(
+    root: &Path,
+    project_path: &Path,
+    retention: TransactionRetention,
+) -> Result<()> {
+    if retention.debug_history {
+        return prune_debug_history(root, None);
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let transaction: Transaction = serde_json::from_slice(&fs::read(path)?)?;
+        if transaction.project_path == project_path && transaction.phase == "CONFLICTED" {
+            remove_transaction_artifacts(&transaction)?;
+        }
+    }
+    Ok(())
+}
+
 fn install_candidate(
     project_path: &Path,
     transaction: &mut Transaction,
     candidate: &Candidate,
+    retention: TransactionRetention,
 ) -> Result<Option<TransactionConflict>> {
     let latest = capture_workspace(project_path)?;
     if latest != transaction.snapshot {
@@ -140,7 +514,7 @@ fn install_candidate(
         }));
     }
     let tracked = tree_paths(project_path, &candidate.working_tree)?;
-    let collisions = find_untracked_collisions(&transaction.snapshot.untracked, &tracked);
+    let collisions = find_untracked_collisions(project_path, &tracked)?;
     if !collisions.is_empty() {
         return Ok(Some(TransactionConflict {
             kind: "untracked-collision".into(),
@@ -175,7 +549,11 @@ fn install_candidate(
     )?;
     transaction.phase = "COMPLETED".into();
     transaction.completed_at = Some(Utc::now().to_rfc3339());
-    write_json(&transaction.path, transaction, 0o600)?;
+    if retention.debug_history {
+        persist_debug_transaction(transaction)?;
+    } else {
+        remove_transaction_artifacts(transaction)?;
+    }
     Ok(None)
 }
 
@@ -184,6 +562,22 @@ pub fn reconcile_workspace(
     previous_remote_oid: &str,
     target_remote_oid: &str,
     transaction_root: Option<&Path>,
+) -> Result<ReconcileResult> {
+    reconcile_workspace_with_retention(
+        project_path,
+        previous_remote_oid,
+        target_remote_oid,
+        transaction_root,
+        TransactionRetention::default(),
+    )
+}
+
+pub fn reconcile_workspace_with_retention(
+    project_path: &Path,
+    previous_remote_oid: &str,
+    target_remote_oid: &str,
+    transaction_root: Option<&Path>,
+    retention: TransactionRetention,
 ) -> Result<ReconcileResult> {
     if previous_remote_oid.is_empty() || target_remote_oid.is_empty() {
         bail!("previousRemoteOid and targetRemoteOid are required");
@@ -253,7 +647,9 @@ pub fn reconcile_workspace(
         completed_at: None,
         recovered_at: None,
     };
-    write_json(&transaction.path, &transaction, 0o600)?;
+    if retention.debug_history {
+        persist_debug_transaction(&transaction)?;
+    }
 
     let temporary = tempdir()?;
     let temporary_path = temporary.path();
@@ -350,8 +746,12 @@ pub fn reconcile_workspace(
             index_tree,
         };
         transaction.candidate = Some(candidate.clone());
-        write_json(&transaction.path, &transaction, 0o600)?;
-        if let Some(conflict) = install_candidate(project_path, &mut transaction, &candidate)? {
+        if retention.debug_history {
+            persist_debug_transaction(&transaction)?;
+        }
+        if let Some(conflict) =
+            install_candidate(project_path, &mut transaction, &candidate, retention)?
+        {
             transaction.phase = "CONFLICTED".into();
             transaction.conflict = Some(conflict.clone());
             write_json(&transaction.path, &transaction, 0o600)?;
@@ -388,6 +788,9 @@ pub fn reconcile_workspace(
         cleanup.clone(),
     );
     let _ = git(project_path, ["branch", "-D", &branch], cleanup);
+    if outcome.is_err() && !retention.debug_history {
+        let _ = remove_transaction_artifacts(&transaction);
+    }
     outcome
 }
 
@@ -413,11 +816,19 @@ fn empty_result() -> ReconcileResult {
 }
 
 pub fn recover_transaction(path: &Path) -> Result<Transaction> {
+    recover_transaction_with_retention(path, TransactionRetention::default())
+}
+
+pub fn recover_transaction_with_retention(
+    path: &Path,
+    retention: TransactionRetention,
+) -> Result<Transaction> {
     let mut transaction: Transaction = serde_json::from_slice(&fs::read(path)?)?;
-    if matches!(
-        transaction.phase.as_str(),
-        "PREPARING" | "CONFLICTED" | "COMPLETED"
-    ) {
+    if matches!(transaction.phase.as_str(), "PREPARING" | "CONFLICTED") {
+        return Ok(transaction);
+    }
+    if matches!(transaction.phase.as_str(), "COMPLETED" | "ROLLED_BACK") {
+        finalize_recovered_transaction(&transaction, retention)?;
         return Ok(transaction);
     }
     if transaction.phase != "INSTALLING" {
@@ -431,7 +842,7 @@ pub fn recover_transaction(path: &Path) -> Result<Transaction> {
     if current.head == candidate.real_head {
         transaction.phase = "COMPLETED".into();
         transaction.recovered_at = Some(Utc::now().to_rfc3339());
-        write_json(path, &transaction, 0o600)?;
+        finalize_recovered_transaction(&transaction, retention)?;
         return Ok(transaction);
     }
     if current.head == transaction.snapshot.head {
@@ -452,11 +863,22 @@ pub fn recover_transaction(path: &Path) -> Result<Transaction> {
         )?;
         transaction.phase = "ROLLED_BACK".into();
         transaction.recovered_at = Some(Utc::now().to_rfc3339());
-        write_json(path, &transaction, 0o600)?;
+        finalize_recovered_transaction(&transaction, retention)?;
         return Ok(transaction);
     }
     bail!(
         "transaction {} needs manual recovery; HEAD matches neither preserved state",
         path.file_name().unwrap_or_default().to_string_lossy()
     )
+}
+
+fn finalize_recovered_transaction(
+    transaction: &Transaction,
+    retention: TransactionRetention,
+) -> Result<()> {
+    if retention.debug_history {
+        persist_debug_transaction(transaction)
+    } else {
+        remove_transaction_artifacts(transaction)
+    }
 }

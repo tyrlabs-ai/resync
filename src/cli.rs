@@ -14,13 +14,17 @@ use crate::rpc::rpc;
 use crate::state::{
     LocalProject, load_catalog, load_config_raw, read_json, state_paths, write_json,
 };
-use crate::transaction::recover_transaction;
+use crate::transaction::{
+    DEBUG_HISTORY_MAX_BYTES, DEBUG_HISTORY_MAX_RECORDS, gc_transactions,
+    recover_transaction_with_retention, transaction_retention,
+};
 use crate::workspace::{install_hooks as install_workspace_hooks, load_workspace};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use reqwest::Method;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -79,6 +83,16 @@ enum Command {
     },
     #[command(about = "Check Git, provider, daemon, identity, and credential state")]
     Doctor,
+    #[command(about = "Prune obsolete transaction records and recovery refs")]
+    Gc {
+        #[arg(long, help = "Report reclaimable artifacts without changing them")]
+        dry_run: bool,
+    },
+    #[command(about = "Manage bounded transaction diagnostic history")]
+    TransactionDebug {
+        #[command(subcommand)]
+        command: TransactionDebugCommand,
+    },
     #[command(
         name = "install-adapters",
         about = "Repair lifecycle adapters for every local project or one selected project"
@@ -126,6 +140,16 @@ enum WorkspaceCommand {
         #[arg(value_name = "WORKSPACE_ROOT")]
         root: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum TransactionDebugCommand {
+    #[command(about = "Retain bounded diagnostic history")]
+    Enable,
+    #[command(about = "Stop retaining non-actionable diagnostic history")]
+    Disable,
+    #[command(about = "Show whether bounded diagnostic history is enabled")]
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -296,6 +320,8 @@ fn preprocess_arguments() -> Vec<String> {
         "peer",
         "daemon",
         "doctor",
+        "gc",
+        "transaction-debug",
         "install-adapters",
         "workspace",
         "acquire",
@@ -365,6 +391,8 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             Ok(None)
         }
         Command::Doctor => Ok(Some(doctor())),
+        Command::Gc { dry_run } => Ok(Some(transaction_gc(dry_run)?)),
+        Command::TransactionDebug { command } => Ok(Some(transaction_debug(command)?)),
         Command::InstallAdapters { project_id } => {
             Ok(Some(install_adapters_command(project_id.as_deref())?))
         }
@@ -403,6 +431,56 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             "new_branch": new_branch
         }))?)),
     }
+}
+
+fn transaction_gc(dry_run: bool) -> Result<Value> {
+    let paths = state_paths();
+    let catalog = load_catalog()?;
+    let managed_project_paths = catalog
+        .projects
+        .iter()
+        .map(|project| project.local_path.clone())
+        .collect::<BTreeSet<_>>();
+    let active_conflict_paths = catalog
+        .projects
+        .into_iter()
+        .filter(|project| project.state == "CONFLICTED")
+        .map(|project| project.local_path)
+        .collect::<BTreeSet<_>>();
+    Ok(serde_json::to_value(gc_transactions(
+        &paths.transactions,
+        &managed_project_paths,
+        &active_conflict_paths,
+        transaction_retention(&paths.root),
+        dry_run,
+    )?)?)
+}
+
+fn transaction_debug(command: TransactionDebugCommand) -> Result<Value> {
+    let paths = state_paths();
+    let marker = paths.root.join("transaction-debug");
+    match command {
+        TransactionDebugCommand::Enable => write_json(
+            &marker,
+            &json!({
+                "enabled": true,
+                "maxRecords": DEBUG_HISTORY_MAX_RECORDS,
+                "maxBytes": DEBUG_HISTORY_MAX_BYTES,
+            }),
+            0o600,
+        )?,
+        TransactionDebugCommand::Disable => match fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        },
+        TransactionDebugCommand::Status => {}
+    }
+    Ok(json!({
+        "enabled": marker.is_file(),
+        "maxRecords": DEBUG_HISTORY_MAX_RECORDS,
+        "maxBytes": DEBUG_HISTORY_MAX_BYTES,
+    }))
 }
 
 fn workspace(command: WorkspaceCommand) -> Result<Value> {
@@ -527,13 +605,15 @@ fn project(command: ProjectCommand) -> Result<Value> {
                 .map(|item| json!({ "projectId": item.project_id, "localPath": item.local_path, "conflict": item.conflict })).collect()))
         }
         ProjectCommand::Recover => {
-            let root = state_paths().transactions;
+            let paths = state_paths();
+            let root = paths.transactions;
+            let retention = transaction_retention(&paths.root);
             let mut recovered = Vec::new();
             if root.exists() {
                 for entry in fs::read_dir(root)? {
                     let path = entry?.path();
                     if path.extension().is_some_and(|value| value == "json") {
-                        let transaction = recover_transaction(&path)?;
+                        let transaction = recover_transaction_with_retention(&path, retention)?;
                         recovered.push(json!({ "id": transaction.id, "phase": transaction.phase }));
                     }
                 }

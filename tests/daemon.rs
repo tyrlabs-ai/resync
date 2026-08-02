@@ -94,6 +94,7 @@ fn failed_automatic_reconciliation_grants_access_until_explicit_sync() -> anyhow
             }))
             .await?;
         assert_eq!(state["reconciliation_mode"], false);
+        assert_eq!(fs::read_dir(&paths.transactions)?.count(), 0);
         anyhow::Ok(())
     })
 }

@@ -1,6 +1,7 @@
 use crate::process::{RunOptions, git};
 use anyhow::Result;
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
@@ -10,7 +11,6 @@ pub struct WorkspaceSnapshot {
     pub head: String,
     pub index_tree: String,
     pub working_tree: String,
-    pub untracked: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -42,20 +42,6 @@ pub fn current_branch(project_path: &Path) -> Result<String> {
     .into())
 }
 
-pub fn list_untracked(project_path: &Path) -> Result<Vec<String>> {
-    let output = git(
-        project_path,
-        ["ls-files", "--others", "-z"],
-        RunOptions::default(),
-    )?
-    .stdout;
-    Ok(output
-        .split('\0')
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .collect())
-}
-
 fn temporary_index(project_path: &Path, seed_tree: &str, update_tracked: bool) -> Result<String> {
     let directory = tempdir()?;
     let index = directory.path().join("index");
@@ -80,12 +66,10 @@ pub fn capture_workspace(project_path: &Path) -> Result<WorkspaceSnapshot> {
         .trim()
         .to_owned();
     let working_tree = temporary_index(project_path, &index_tree, true)?;
-    let untracked = list_untracked(project_path)?;
     Ok(WorkspaceSnapshot {
         head,
         index_tree,
         working_tree,
-        untracked,
     })
 }
 
@@ -140,27 +124,68 @@ pub fn tree_paths(project_path: &Path, tree: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-pub fn find_untracked_collisions(untracked: &[String], tracked: &[String]) -> Vec<String> {
-    let tracked_set: BTreeSet<&str> = tracked.iter().map(String::as_str).collect();
+pub fn find_untracked_collisions(
+    project_path: &Path,
+    candidate_tracked: &[String],
+) -> Result<Vec<String>> {
+    let current = git(
+        project_path,
+        ["ls-files", "--cached", "-z"],
+        RunOptions::default(),
+    )?
+    .stdout;
+    let current_tracked = current
+        .split('\0')
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>();
     let mut collisions = BTreeSet::new();
-    for path in untracked {
-        if tracked_set.contains(path.as_str()) {
-            collisions.insert(path.clone());
-        }
-        let pieces: Vec<&str> = path.split('/').collect();
+
+    for candidate in candidate_tracked {
+        let pieces = candidate.split('/').collect::<Vec<_>>();
+        let mut ancestor_collision = false;
         for index in 1..pieces.len() {
-            if tracked_set.contains(pieces[..index].join("/").as_str()) {
-                collisions.insert(path.clone());
+            let ancestor = pieces[..index].join("/");
+            let path = project_path.join(&ancestor);
+            if let Ok(metadata) = fs::symlink_metadata(path)
+                && !metadata.file_type().is_dir()
+                && !current_tracked.contains(ancestor.as_str())
+            {
+                collisions.insert(ancestor);
+                ancestor_collision = true;
+                break;
             }
         }
-        if tracked
-            .iter()
-            .any(|candidate| candidate.starts_with(&format!("{path}/")))
-        {
-            collisions.insert(path.clone());
+        if ancestor_collision || current_tracked.contains(candidate.as_str()) {
+            continue;
+        }
+
+        let path = project_path.join(candidate);
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() {
+            collisions.insert(candidate.clone());
+            continue;
+        }
+
+        let prefix = format!("{candidate}/");
+        let has_tracked_descendants = current_tracked.iter().any(|path| path.starts_with(&prefix));
+        if !has_tracked_descendants {
+            collisions.insert(candidate.clone());
+            continue;
+        }
+
+        let untracked = git(
+            project_path,
+            ["ls-files", "--others", "-z", "--", candidate],
+            RunOptions::default(),
+        )?
+        .stdout;
+        if !untracked.is_empty() {
+            collisions.insert(candidate.clone());
         }
     }
-    collisions.into_iter().collect()
+    Ok(collisions.into_iter().collect())
 }
 
 pub fn git_dir(project_path: &Path) -> Result<PathBuf> {

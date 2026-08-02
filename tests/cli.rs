@@ -61,6 +61,49 @@ fn npm_install_has_no_lifecycle_scripts() -> anyhow::Result<()> {
 }
 
 #[test]
+fn transaction_debug_mode_is_explicit_and_gc_supports_dry_run() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+
+    let status = Command::cargo_bin("resync")
+        .unwrap()
+        .env("RESYNC_STATE_DIR", &state)
+        .args(["transaction-debug", "status"])
+        .assert()
+        .success();
+    let output: serde_json::Value = serde_json::from_slice(&status.get_output().stdout)?;
+    assert_eq!(output["enabled"], false);
+
+    Command::cargo_bin("resync")
+        .unwrap()
+        .env("RESYNC_STATE_DIR", &state)
+        .args(["transaction-debug", "enable"])
+        .assert()
+        .success();
+    assert!(state.join("transaction-debug").is_file());
+
+    let dry_run = Command::cargo_bin("resync")
+        .unwrap()
+        .env("RESYNC_STATE_DIR", &state)
+        .args(["gc", "--dry-run"])
+        .assert()
+        .success();
+    let output: serde_json::Value = serde_json::from_slice(&dry_run.get_output().stdout)?;
+    assert_eq!(output["dryRun"], true);
+    assert_eq!(output["debugHistory"], true);
+    assert_eq!(output["scanned"], 0);
+
+    Command::cargo_bin("resync")
+        .unwrap()
+        .env("RESYNC_STATE_DIR", &state)
+        .args(["transaction-debug", "disable"])
+        .assert()
+        .success();
+    assert!(!state.join("transaction-debug").exists());
+    Ok(())
+}
+
+#[test]
 fn install_adapters_without_project_repairs_every_local_checkout() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let state = root.path().join("state");
