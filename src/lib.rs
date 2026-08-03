@@ -16,4 +16,7 @@ pub mod state;
 pub mod transaction;
 pub mod workspace;
 
-pub use protocol::{Catalog, CatalogProject, PROTOCOL_VERSION};
+pub use protocol::{
+    Catalog, CatalogProject, NamedLease, NamedLeaseListResponse, NamedLeaseMutationResponse,
+    NamedLeaseOutcome, NamedLeasePolicy, PROTOCOL_VERSION,
+};

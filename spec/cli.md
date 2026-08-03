@@ -31,6 +31,13 @@ device
   list
   revoke <device-id>
 
+lease
+  acquire <resource-key> [--project PROJECT_ID] [--holder HOLDER_ID] [--ttl DURATION]
+  get <resource-key> [--project PROJECT_ID]
+  list [--project PROJECT_ID] [--prefix PREFIX]
+  renew <lease-id> --holder HOLDER_ID [--ttl DURATION]
+  release <lease-id> --holder HOLDER_ID
+
 peer
   sync <ssh-target>
   accept                       # internal remote helper
@@ -41,6 +48,54 @@ upgrade                              # converge launcher, daemon, adapters, and 
 install-adapters [PROJECT_ID]        # repair all local projects, or one selected project
 workspace
   install-hooks [WORKSPACE_ROOT]     # install one explicit multi-project Codex dispatcher
+```
+
+`lease` operates provider-hosted, project-scoped named leases. It does not call
+the local daemon and must not be confused with the top-level engineering-preview
+compatibility commands `acquire` and `release`, which continue to bracket local
+workspace access.
+
+Named-lease acquisition is immediate and has no wait loop. When `--project` is
+omitted, commands use the enrolled repository containing the current directory,
+including its service origin and project ID. An explicit project ID may be used
+outside a checkout only when it resolves through the local catalog. The client
+must discover `project-named-leases-v1`, the named-leases endpoint, and a valid
+TTL policy before creating local receipt state or sending a request. Unsupported
+and unreachable providers are errors; RepoSync does not create a local fallback
+claim.
+
+`--ttl` uses the normal duration grammar, must resolve to whole seconds without
+overflow, and must be within the advertised provider policy. Omitting it uses
+the provider default. Resource keys and prefixes follow the portable grammar in
+the protocol specification and are validated before transport.
+
+The client generates a high-entropy holder secret and stores it only in a
+mode-`0600` crash-safe receipt below RepoSync's per-user state directory. Before
+sending acquire it records the pending request ID and proof, and an ambiguous
+retry reuses them. Once `ACQUIRED` is validated, it records the active receipt
+before deleting pending state or printing success. Receipt paths are derived
+from hashes of provider/project/lease/holder identities, never directly from a
+resource key or holder string.
+
+When `--holder` is omitted, acquire generates an opaque holder ID and returns
+that public ID with the mutation response. `renew` and `release` require the
+matching holder ID so they can select the exact local receipt; neither command
+accepts the holder secret in argv. Mutation request IDs persist across ambiguous
+retries. Confirmed release or an authoritative provider loss may remove or
+tombstone the receipt; a local clock deadline or transport error may not.
+
+All successful output is pretty JSON on stdout. Expected provider outcomes are
+also preserved as JSON on stdout while diagnostics go to stderr. `HELD` exits
+with status `3`, allowing a scheduler to distinguish ordinary contention from
+transport, configuration, or other failures without scraping prose. Other
+errors exit nonzero. Examples:
+
+```sh
+resync lease acquire waykeeper/maps/01h-map/tickets/01h-ticket --ttl 15m
+resync lease get waykeeper/maps/01h-map/tickets/01h-ticket
+resync lease list --project prj_example --prefix waykeeper/
+resync lease renew nls_example --holder worker-example --ttl 15m
+resync lease release nls_example --holder worker-example
 ```
 
 Compatibility aliases from the engineering preview MAY remain, but grouped commands are canonical. A non-command first positional value is treated as an SSH target only while inside an enrolled Git checkout; unknown command-like values outside that context produce help and an error.

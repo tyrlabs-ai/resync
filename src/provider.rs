@@ -1,7 +1,7 @@
 use crate::credentials::{
     DeviceIdentity, canonical_origin, generate_device_identity, store_credential,
 };
-use crate::protocol::PROTOCOL_VERSION;
+use crate::protocol::{NamedLeasePolicy, PROTOCOL_VERSION};
 use crate::state::{ProviderConfig, load_config_raw, state_paths, write_json};
 use anyhow::{Result, bail};
 use chrono::Utc;
@@ -10,6 +10,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::fmt;
 use url::Url;
 
 pub const DEFAULT_PROVIDER: &str = "https://resync-hosted-production.up.railway.app";
@@ -23,9 +24,35 @@ pub struct Discovery {
     #[serde(default)]
     pub capabilities: Vec<String>,
     pub endpoints: BTreeMap<String, String>,
+    #[serde(default)]
+    pub named_lease_policy: Option<NamedLeasePolicy>,
     #[serde(skip)]
     pub origin: String,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderHttpResponse {
+    pub status: u16,
+    pub body: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderHttpError {
+    pub status: u16,
+    pub body: Value,
+}
+
+impl fmt::Display for ProviderHttpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(message) = self.body.get("error").and_then(Value::as_str) {
+            formatter.write_str(message)
+        } else {
+            write!(formatter, "provider request failed ({})", self.status)
+        }
+    }
+}
+
+impl std::error::Error for ProviderHttpError {}
 
 pub fn default_provider() -> String {
     std::env::var("RESYNC_DEFAULT_PROVIDER").unwrap_or_else(|_| DEFAULT_PROVIDER.into())
@@ -45,6 +72,9 @@ pub fn discover(provider: Option<&str>) -> Result<Discovery> {
     if document.protocol != PROTOCOL_VERSION || document.endpoints.is_empty() {
         bail!("provider does not advertise a compatible resync.v1 service");
     }
+    if let Some(policy) = &document.named_lease_policy {
+        policy.validate()?;
+    }
     for value in document.endpoints.values_mut() {
         *value = Url::parse(&origin)?.join(value)?.to_string();
     }
@@ -58,6 +88,20 @@ pub fn provider_fetch(
     method: Method,
     body: Option<&Value>,
 ) -> Result<Value> {
+    provider_request(url, token, method, body)
+        .map(|response| response.body)
+        .map_err(|error| match error.downcast::<ProviderHttpError>() {
+            Ok(http_error) => anyhow::anyhow!(http_error.to_string()),
+            Err(error) => error,
+        })
+}
+
+pub fn provider_request(
+    url: &str,
+    token: Option<&str>,
+    method: Method,
+    body: Option<&Value>,
+) -> Result<ProviderHttpResponse> {
     let client = Client::new();
     let mut request = client
         .request(method, url)
@@ -78,16 +122,16 @@ pub fn provider_fetch(
             .unwrap_or_else(|_| json!({ "error": text.chars().take(500).collect::<String>() }))
     };
     if !status.is_success() {
-        bail!(
-            "{}",
-            value
-                .get("error")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("provider request failed ({})", status.as_u16()))
-        );
+        return Err(ProviderHttpError {
+            status: status.as_u16(),
+            body: value,
+        }
+        .into());
     }
-    Ok(value)
+    Ok(ProviderHttpResponse {
+        status: status.as_u16(),
+        body: value,
+    })
 }
 
 pub fn enroll_with_token(
@@ -166,4 +210,50 @@ pub fn store_provider_login(
         },
     );
     write_json(&state_paths().config, &config, 0o600)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn discovery_policy_remains_optional_for_older_providers() {
+        let discovery: Discovery = serde_json::from_value(json!({
+            "protocol": "resync.v1",
+            "service_id": "svc_test",
+            "endpoints": { "catalog": "/v1/catalog" }
+        }))
+        .unwrap();
+        assert_eq!(discovery.named_lease_policy, None);
+    }
+
+    #[test]
+    fn provider_request_preserves_structured_non_success_bodies() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let body = r#"{"outcome":"HELD","lease":{"lease_id":"nls_1"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let error = provider_request(&format!("http://{address}/lease"), None, Method::POST, None)
+            .unwrap_err();
+        let http = error.downcast_ref::<ProviderHttpError>().unwrap();
+        assert_eq!(http.status, 409);
+        assert_eq!(http.body["outcome"], "HELD");
+        assert_eq!(http.body["lease"]["lease_id"], "nls_1");
+        server.join().unwrap();
+    }
 }

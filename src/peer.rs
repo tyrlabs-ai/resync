@@ -559,6 +559,7 @@ mod tests {
                 "join_tickets".into(),
                 "https://provider.example/v1/projects/%7Bproject_id%7D/join-tickets".into(),
             )]),
+            named_lease_policy: None,
             origin: "https://provider.example".into(),
         };
         assert_eq!(
