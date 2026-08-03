@@ -58,6 +58,8 @@ pub struct NamedLeaseReceipt {
     pub lease: Option<NamedLease>,
     #[serde(default)]
     pub pending_mutation: Option<PendingMutation>,
+    #[serde(default)]
+    pub authority_recorded_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug)]
@@ -171,6 +173,9 @@ pub fn acquire(
         holder_id,
     )?;
     let (pending_path, receipt) = if let Some(existing) = existing {
+        if existing.1.requested_ttl_seconds != ttl {
+            bail!("pending named-lease acquisition uses a different TTL");
+        }
         existing
     } else {
         let holder_id = holder_id
@@ -189,6 +194,7 @@ pub fn acquire(
             requested_ttl_seconds: ttl,
             lease: None,
             pending_mutation: None,
+            authority_recorded_at: None,
         };
         let path = pending_receipt_path(&pending_directory, &receipt);
         write_json(&path, &receipt, 0o600)?;
@@ -227,6 +233,7 @@ pub fn acquire(
     let active = NamedLeaseReceipt {
         state: NamedLeaseReceiptState::Active,
         lease: Some(lease.clone()),
+        authority_recorded_at: Some(Utc::now()),
         ..receipt
     };
     let active_path = active_receipt_path(&pending_directory, &lease.lease_id, &active.holder_id);
@@ -324,14 +331,18 @@ pub fn active_receipt(
         .transpose()
 }
 
-pub fn next_renewal_at(lease: &NamedLease) -> DateTime<Utc> {
-    let lifetime = lease.expires_at - lease.acquired_at;
+pub fn next_renewal_at(receipt: &NamedLeaseReceipt) -> Result<DateTime<Utc>> {
+    let lease = receipt.lease.as_ref().context("receipt has no lease")?;
+    let observed_at = receipt
+        .authority_recorded_at
+        .context("receipt has no authority observation time")?;
+    let lifetime = lease.expires_at - observed_at;
     let lifetime_millis = lifetime.num_milliseconds().max(1);
     let jitter_window = (lifetime_millis / 15).max(1);
     let digest = Sha256::digest(lease.lease_id.as_bytes());
     let sample = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 has eight bytes"));
     let jitter = i64::try_from(sample % u64::try_from(jitter_window).unwrap_or(1)).unwrap_or(0);
-    lease.acquired_at + chrono::Duration::milliseconds(lifetime_millis / 3 + jitter)
+    Ok(observed_at + chrono::Duration::milliseconds(lifetime_millis / 3 + jitter))
 }
 
 fn mutate_active_receipt(
@@ -400,6 +411,7 @@ fn mutate_active_receipt(
         NamedLeaseOutcome::Renewed => {
             receipt.lease = response.lease.clone();
             receipt.pending_mutation = None;
+            receipt.authority_recorded_at = Some(Utc::now());
             write_json(&path, &receipt, 0o600)?;
         }
         NamedLeaseOutcome::Released => remove_receipt(&path)?,
@@ -703,14 +715,19 @@ mod tests {
                     .to_utc(),
             }),
             pending_mutation: None,
+            authority_recorded_at: Some(
+                DateTime::parse_from_rfc3339("2026-08-03T00:00:01Z")
+                    .unwrap()
+                    .to_utc(),
+            ),
         };
         let now = DateTime::parse_from_rfc3339("2026-08-03T00:15:00Z")
             .unwrap()
             .to_utc();
         assert!(receipt_is_locally_expired(&receipt, now));
         assert!(receipt.lease.is_some());
-        let renewal = next_renewal_at(receipt.lease.as_ref().unwrap());
-        assert!(renewal > receipt.lease.as_ref().unwrap().acquired_at);
+        let renewal = next_renewal_at(&receipt).unwrap();
+        assert!(renewal > receipt.authority_recorded_at.unwrap());
         assert!(renewal < receipt.lease.as_ref().unwrap().expires_at);
     }
 }
