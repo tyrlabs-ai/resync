@@ -1815,7 +1815,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn new_daemon_build_repairs_adapters_once() -> anyhow::Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -1890,6 +1889,7 @@ mod tests {
         assert!(!daemon_matches_client(&json!({ "pid": 42 }), "current"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn exact_running_daemon_does_not_require_upgrade_restart() -> anyhow::Result<()> {
         let executable = std::env::current_exe()?;
