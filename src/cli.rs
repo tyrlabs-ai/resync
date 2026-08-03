@@ -1073,15 +1073,20 @@ fn remove_legacy_package_installs(install_root: &Path) -> Result<Vec<String>> {
             if !manifest.exists() {
                 continue;
             }
-            let npm = version.path().join("bin/npm");
-            let result = run_process(
-                &npm,
-                ["uninstall", "--global", package],
-                RunOptions {
-                    allow_failure: true,
-                    ..RunOptions::default()
-                },
-            )?;
+            let node_bin = version.path().join("bin");
+            let npm = node_bin.join("npm");
+            let mut path = vec![node_bin];
+            if let Some(current) = std::env::var_os("PATH") {
+                path.extend(std::env::split_paths(&current));
+            }
+            let mut options = RunOptions {
+                allow_failure: true,
+                ..RunOptions::default()
+            };
+            options
+                .env
+                .insert("PATH".into(), std::env::join_paths(path)?);
+            let result = run_process(&npm, ["uninstall", "--global", package], options)?;
             if result.code != 0 || manifest.exists() {
                 bail!(
                     "could not remove obsolete NVM RepoSync installation at {}: {}",
