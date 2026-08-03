@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -1606,6 +1607,7 @@ fn daemon_matches_client(ping: &Value, client_binary_id: &str) -> bool {
     ping.get("binaryId").and_then(Value::as_str) == Some(client_binary_id)
 }
 
+#[cfg(target_os = "linux")]
 fn daemon_matches_exact_executable(
     ping: &Value,
     client_binary_id: &str,
@@ -1654,7 +1656,7 @@ fn terminate_stale_daemon(ping: &Value) -> Result<()> {
     bail!("stale RepoSync daemon {pid} did not stop after SIGTERM")
 }
 
-pub(crate) fn ensure_daemon_supervision(restart: bool) -> Result<&'static str> {
+pub(crate) fn ensure_daemon_supervision(_restart: bool) -> Result<&'static str> {
     // An explicit state directory is an isolated CLI/test instance. It must not
     // rewrite or start the user's global systemd service with this executable.
     if std::env::var_os("RESYNC_STATE_DIR").is_some() {
@@ -1711,7 +1713,7 @@ pub(crate) fn ensure_daemon_supervision(restart: bool) -> Result<&'static str> {
                 });
             run(
                 "systemctl",
-                if restart && (!service_active || !exact_daemon) {
+                if _restart && (!service_active || !exact_daemon) {
                     vec!["--user", "restart", "resync.service"]
                 } else if service_active {
                     vec!["--user", "enable", "resync.service"]
@@ -1803,10 +1805,9 @@ pub fn daemon_rpc(request: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LeaseGate, ResyncDaemon, daemon_matches_client, daemon_matches_exact_executable,
-        repair_adapters_for_build,
-    };
+    #[cfg(target_os = "linux")]
+    use super::daemon_matches_exact_executable;
+    use super::{LeaseGate, ResyncDaemon, daemon_matches_client, repair_adapters_for_build};
     use crate::state::{Config, LocalCatalog, LocalProject, StatePaths, read_json};
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1814,6 +1815,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn new_daemon_build_repairs_adapters_once() -> anyhow::Result<()> {
         let temporary = tempfile::tempdir()?;
