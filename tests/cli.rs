@@ -3,6 +3,9 @@ use predicates::prelude::*;
 use resync::state::{LocalCatalog, LocalProject, write_json};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
 
 fn local_project(project_id: &str, local_path: std::path::PathBuf) -> LocalProject {
     LocalProject {
@@ -41,6 +44,12 @@ fn version_and_help_are_available() {
         vec!["project", "--help"],
         vec!["project", "join", "--help"],
         vec!["device", "--help"],
+        vec!["lease", "--help"],
+        vec!["lease", "acquire", "--help"],
+        vec!["lease", "get", "--help"],
+        vec!["lease", "list", "--help"],
+        vec!["lease", "renew", "--help"],
+        vec!["lease", "release", "--help"],
         vec!["peer", "sync", "--help"],
         vec!["daemon", "--help"],
     ] {
@@ -51,6 +60,207 @@ fn version_and_help_are_available() {
             .success()
             .stdout(predicate::str::contains("Usage:"));
     }
+}
+
+fn json_files(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            files.extend(json_files(&path)?);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn serve_response(
+    stream: &mut std::net::TcpStream,
+    status: &str,
+    body: &str,
+) -> anyhow::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )?;
+    Ok(())
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> anyhow::Result<String> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        let Some(headers_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let header_text = String::from_utf8_lossy(&bytes[..headers_end]);
+        let content_length = header_text
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::trim)
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        if bytes.len() >= headers_end + 4 + content_length {
+            break;
+        }
+    }
+    Ok(String::from_utf8(bytes)?)
+}
+
+#[test]
+fn named_lease_acquire_persists_pending_before_transport_and_active_before_output()
+-> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let origin = format!("http://{}", listener.local_addr()?);
+    let project_id = "prj_cli_named_lease";
+    let mut project = local_project(project_id, root.path().join("not-a-checkout"));
+    project.service = Some(origin.clone());
+    write_json(
+        &state.join("catalog.json"),
+        &LocalCatalog {
+            catalog_generation: 1,
+            projects: vec![project],
+        },
+        0o600,
+    )?;
+    write_json(
+        &state.join("credentials.json"),
+        &serde_json::json!({
+            "version": 1,
+            "providers": {
+                origin.clone(): {
+                    "token": "test-device-token",
+                    "updatedAt": "2026-08-03T00:00:00Z"
+                }
+            }
+        }),
+        0o600,
+    )?;
+    let server_state = state.clone();
+    let server_origin = origin.clone();
+    let server = thread::spawn(move || -> anyhow::Result<()> {
+        let (mut discovery, _) = listener.accept()?;
+        let request = read_http_request(&mut discovery)?;
+        anyhow::ensure!(request.starts_with("GET /.well-known/resync "));
+        serve_response(
+            &mut discovery,
+            "200 OK",
+            &serde_json::json!({
+                "protocol": "resync.v1",
+                "service_id": "svc_test",
+                "capabilities": ["project-named-leases-v1"],
+                "endpoints": {
+                    "named_leases": format!("{server_origin}/v1/projects/{{project_id}}/named-leases")
+                },
+                "named_lease_policy": {
+                    "default_ttl_seconds": 900,
+                    "min_ttl_seconds": 30,
+                    "max_ttl_seconds": 3600
+                }
+            })
+            .to_string(),
+        )?;
+        let (mut acquire, _) = listener.accept()?;
+        let request = read_http_request(&mut acquire)?;
+        anyhow::ensure!(
+            request.starts_with(&format!("POST /v1/projects/{project_id}/named-leases "))
+        );
+        anyhow::ensure!(request.contains("test-device-token"));
+        let pending = json_files(&server_state.join("named-leases"))?;
+        anyhow::ensure!(pending.len() == 1);
+        anyhow::ensure!(
+            pending[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pending-")
+        );
+        let pending_value: serde_json::Value = serde_json::from_slice(&fs::read(&pending[0])?)?;
+        anyhow::ensure!(pending_value["state"] == "PENDING");
+        let response = serde_json::json!({
+            "outcome": "ACQUIRED",
+            "lease": {
+                "lease_id": "nls_cli_example",
+                "project_id": project_id,
+                "resource_key": "waykeeper/maps/map/tickets/ticket",
+                "holder_device_id": "dev_cli",
+                "holder_id": "worker-a",
+                "generation": 1,
+                "acquired_at": "2026-08-03T00:00:00Z",
+                "expires_at": "2026-08-03T00:15:00Z"
+            }
+        });
+        serve_response(&mut acquire, "201 Created", &response.to_string())?;
+        Ok(())
+    });
+
+    let assertion = Command::cargo_bin("resync")
+        .unwrap()
+        .env("RESYNC_STATE_DIR", &state)
+        .args([
+            "lease",
+            "acquire",
+            "waykeeper/maps/map/tickets/ticket",
+            "--project",
+            project_id,
+            "--holder",
+            "worker-a",
+            "--ttl",
+            "15m",
+        ])
+        .assert()
+        .success();
+    server.join().unwrap()?;
+    let stdout = String::from_utf8(assertion.get_output().stdout.clone())?;
+    let stderr = String::from_utf8(assertion.get_output().stderr.clone())?;
+    assert!(stdout.contains("nls_cli_example"));
+    assert!(!stdout.contains("holder_secret"));
+    assert!(!stderr.contains("holder_secret"));
+    let active = json_files(&state.join("named-leases"))?;
+    assert_eq!(active.len(), 1);
+    assert!(
+        active[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("nls_cli_example-")
+    );
+    let active_value: serde_json::Value = serde_json::from_slice(&fs::read(&active[0])?)?;
+    assert_eq!(active_value["state"], "ACTIVE");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&active[0])?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(active[0].parent().unwrap())?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    Ok(())
 }
 
 #[test]

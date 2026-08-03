@@ -17,6 +17,7 @@ pub struct StatePaths {
     pub keys: PathBuf,
     pub catalog: PathBuf,
     pub transactions: PathBuf,
+    pub named_lease_receipts: PathBuf,
     pub daemon_lock: PathBuf,
     pub socket: PathBuf,
 }
@@ -55,6 +56,7 @@ pub fn state_paths() -> StatePaths {
         keys: root.join("keys"),
         catalog: root.join("catalog.json"),
         transactions: root.join("transactions"),
+        named_lease_receipts: root.join("named-leases"),
         daemon_lock: root.join("daemon.lock"),
         socket,
         root,

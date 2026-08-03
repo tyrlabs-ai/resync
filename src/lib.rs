@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod git_state;
 mod hook_dispatcher;
 pub mod identity;
+pub mod named_lease;
 pub mod peer;
 pub mod process;
 pub mod protocol;

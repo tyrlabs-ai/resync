@@ -5,9 +5,14 @@ use crate::credentials::{
 use crate::daemon::{daemon_rpc, ensure_daemon_supervision, run_daemon, runtime};
 use crate::hook_dispatcher::{ensure_project_dispatcher, is_reposync_project_command, shell_quote};
 use crate::identity::{clear_identity, read_identity, repository_root, write_identity};
+use crate::named_lease::{
+    NamedLeaseProviderOutcome, acquire as acquire_named_lease, get as get_named_lease,
+    list as list_named_leases, release as release_named_lease, renew as renew_named_lease,
+    resolve_project as resolve_named_lease_project,
+};
 use crate::peer::{AcceptOptions, peer_accept, peer_sync};
 use crate::process::{RunOptions, git, run as run_process};
-use crate::protocol::CatalogProject;
+use crate::protocol::{CatalogProject, NamedLeaseOutcome};
 use crate::provider::{default_provider, discover, enroll_with_token, provider_fetch};
 use crate::remote::{fetch_catalog, materialize_project, resolved_config};
 use crate::rpc::rpc;
@@ -70,6 +75,11 @@ enum Command {
     Device {
         #[command(subcommand)]
         command: DeviceCommand,
+    },
+    #[command(about = "Manage provider-hosted project-scoped named leases")]
+    Lease {
+        #[command(subcommand)]
+        command: LeaseCommand,
     },
     #[command(about = "Enroll another machine in the same project over SSH")]
     Peer {
@@ -139,6 +149,66 @@ enum Command {
         new_branch: String,
     },
 }
+
+#[derive(Subcommand)]
+enum LeaseCommand {
+    #[command(about = "Immediately acquire one project-scoped resource key")]
+    Acquire {
+        resource_key: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        holder: Option<String>,
+        #[arg(long)]
+        ttl: Option<String>,
+    },
+    #[command(about = "Inspect the live lease for one exact resource key")]
+    Get {
+        resource_key: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    #[command(about = "List live leases below one complete-segment prefix")]
+    List {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        prefix: String,
+    },
+    #[command(about = "Renew an exact lease using its protected local receipt")]
+    Renew {
+        lease_id: String,
+        #[arg(long)]
+        holder: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        ttl: Option<String>,
+    },
+    #[command(about = "Release an exact lease using its protected local receipt")]
+    Release {
+        lease_id: String,
+        #[arg(long)]
+        holder: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+pub struct StructuredCliError {
+    pub exit_code: i32,
+    pub value: Value,
+    pub diagnostic: String,
+}
+
+impl std::fmt::Display for StructuredCliError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for StructuredCliError {}
 
 #[derive(Subcommand)]
 enum WorkspaceCommand {
@@ -300,6 +370,94 @@ fn print(value: &Value) -> Result<()> {
     Ok(())
 }
 
+pub fn structured_error(error: &anyhow::Error) -> Option<&StructuredCliError> {
+    error.downcast_ref()
+}
+
+fn lease(command: LeaseCommand) -> Result<Value> {
+    let current_dir = std::env::current_dir()?;
+    match command {
+        LeaseCommand::Acquire {
+            resource_key,
+            project,
+            holder,
+            ttl,
+        } => {
+            let project = resolve_named_lease_project(project.as_deref(), &current_dir)?;
+            named_lease_result(acquire_named_lease(
+                &project,
+                &resource_key,
+                holder.as_deref(),
+                ttl.as_deref().map(parse_lease_ttl).transpose()?,
+            ))
+        }
+        LeaseCommand::Get {
+            resource_key,
+            project,
+        } => {
+            let project = resolve_named_lease_project(project.as_deref(), &current_dir)?;
+            Ok(json!({ "lease": get_named_lease(&project, &resource_key)? }))
+        }
+        LeaseCommand::List { project, prefix } => {
+            let project = resolve_named_lease_project(project.as_deref(), &current_dir)?;
+            Ok(json!({ "leases": list_named_leases(&project, &prefix)? }))
+        }
+        LeaseCommand::Renew {
+            lease_id,
+            holder,
+            project,
+            ttl,
+        } => {
+            let project = resolve_named_lease_project(project.as_deref(), &current_dir)?;
+            named_lease_result(renew_named_lease(
+                &project,
+                &lease_id,
+                &holder,
+                ttl.as_deref().map(parse_lease_ttl).transpose()?,
+            ))
+        }
+        LeaseCommand::Release {
+            lease_id,
+            holder,
+            project,
+        } => {
+            let project = resolve_named_lease_project(project.as_deref(), &current_dir)?;
+            named_lease_result(release_named_lease(&project, &lease_id, &holder))
+        }
+    }
+}
+
+fn named_lease_result(
+    result: Result<crate::protocol::NamedLeaseMutationResponse>,
+) -> Result<Value> {
+    match result {
+        Ok(response) => Ok(serde_json::to_value(response)?),
+        Err(error) => {
+            let Some(outcome) = error.downcast_ref::<NamedLeaseProviderOutcome>() else {
+                return Err(error);
+            };
+            Err(StructuredCliError {
+                exit_code: if outcome.response.outcome == NamedLeaseOutcome::Held {
+                    3
+                } else {
+                    1
+                },
+                value: serde_json::to_value(&outcome.response)?,
+                diagnostic: outcome.to_string(),
+            }
+            .into())
+        }
+    }
+}
+
+fn parse_lease_ttl(value: &str) -> Result<u64> {
+    let duration = parse_duration(value)?;
+    if duration.subsec_nanos() != 0 || duration.as_secs() == 0 {
+        bail!("named-lease TTL must be a positive whole number of seconds");
+    }
+    Ok(duration.as_secs())
+}
+
 fn preprocess_arguments() -> Vec<String> {
     let mut args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -324,6 +482,7 @@ fn preprocess_arguments() -> Vec<String> {
         "auth",
         "project",
         "device",
+        "lease",
         "peer",
         "daemon",
         "doctor",
@@ -394,6 +553,7 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
         Command::Auth { command } => Ok(Some(auth(command)?)),
         Command::Project { command } => Ok(Some(project(command)?)),
         Command::Device { command } => Ok(Some(device(command)?)),
+        Command::Lease { command } => Ok(Some(lease(command)?)),
         Command::Peer { command } => Ok(Some(peer(command)?)),
         Command::Daemon { poll_interval } => {
             runtime()?.block_on(run_daemon(parse_duration(&poll_interval)?))?;
@@ -1800,6 +1960,22 @@ fn parse_duration(value: &str) -> Result<Duration> {
     }
     if let Some(seconds) = value.strip_suffix('s') {
         return Ok(Duration::from_secs(seconds.parse()?));
+    }
+    if let Some(minutes) = value.strip_suffix('m') {
+        return Ok(Duration::from_secs(
+            minutes
+                .parse::<u64>()?
+                .checked_mul(60)
+                .context("duration overflow")?,
+        ));
+    }
+    if let Some(hours) = value.strip_suffix('h') {
+        return Ok(Duration::from_secs(
+            hours
+                .parse::<u64>()?
+                .checked_mul(3600)
+                .context("duration overflow")?,
+        ));
     }
     Ok(Duration::from_secs(value.parse()?))
 }
