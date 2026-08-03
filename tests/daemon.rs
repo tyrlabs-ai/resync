@@ -13,6 +13,182 @@ use std::thread;
 use std::time::Duration;
 
 #[test]
+fn access_leases_are_idempotent_and_expiry_cleans_every_index() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let project = LocalProject {
+        project_id: "prj_idempotent_lease".into(),
+        local_path: fixture.local.clone(),
+        remote_url: fixture.remote.to_string_lossy().into_owned(),
+        remote_name: "origin".into(),
+        default_branch: "main".into(),
+        server_generation: 1,
+        advertised_heads: BTreeMap::from([("main".into(), fixture.base.clone())]),
+        last_applied_heads: BTreeMap::from([("main".into(), fixture.base)]),
+        active_branch: Some("main".into()),
+        workspace_generation: 1,
+        state: "CURRENT".into(),
+        durability: "REMOTELY_DURABLE".into(),
+        conflict: None,
+        last_error: None,
+        service: None,
+        checkout_id: None,
+        extra: BTreeMap::new(),
+    };
+    let root = fixture.root.path().join("state");
+    let paths = StatePaths {
+        config: root.join("config.json"),
+        credentials: root.join("credentials.json"),
+        keys: root.join("keys"),
+        catalog: root.join("catalog.json"),
+        transactions: root.join("transactions"),
+        daemon_lock: root.join("daemon.lock"),
+        socket: root.join("daemon.sock"),
+        root,
+    };
+    let daemon = ResyncDaemon::from_parts(
+        paths,
+        Config::default(),
+        LocalCatalog {
+            catalog_generation: 1,
+            projects: vec![project],
+        },
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+    )?;
+    let runtime = resync::daemon::runtime()?;
+    runtime.block_on(async {
+        let request = serde_json::json!({
+            "method": "acquireAccess",
+            "project_id": "prj_idempotent_lease",
+            "session_id": "session",
+            "call_id": "call"
+        });
+        let first = daemon.handle(request.clone()).await?;
+        let duplicate = daemon.handle(request.clone()).await?;
+        assert_eq!(
+            duplicate["lease_id"], first["lease_id"],
+            "the same project/session/call must resolve to one lease"
+        );
+
+        let release = serde_json::json!({
+            "method": "releaseAccess",
+            "lease_id": first["lease_id"]
+        });
+        assert_eq!(daemon.handle(release.clone()).await?["released"], true);
+        assert_eq!(
+            daemon.handle(release).await?["released"],
+            false,
+            "duplicate release is a successful no-op"
+        );
+
+        let expiring = daemon.handle(request.clone()).await?;
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(
+            daemon
+                .handle(serde_json::json!({
+                    "method": "releaseAccess",
+                    "lease_id": expiring["lease_id"]
+                }))
+                .await?["released"],
+            false,
+            "expiry removes the lease and all lookup entries"
+        );
+        let renewed = daemon.handle(request.clone()).await?;
+        assert_ne!(renewed["lease_id"], expiring["lease_id"]);
+        assert_eq!(
+            daemon.handle(request).await?["lease_id"],
+            renewed["lease_id"],
+            "the renewed call is indexed exactly once"
+        );
+        anyhow::Ok(())
+    })
+}
+
+#[test]
+fn remote_publication_does_not_wait_for_workspace_leases() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    fs::write(fixture.local.join("published"), "new commit\n")?;
+    git(&fixture.local, ["add", "."], RunOptions::default())?;
+    git(
+        &fixture.local,
+        ["commit", "-m", "publish without workspace gate"],
+        RunOptions::default(),
+    )?;
+    let project = LocalProject {
+        project_id: "prj_publication_gate".into(),
+        local_path: fixture.local.clone(),
+        remote_url: fixture.remote.to_string_lossy().into_owned(),
+        remote_name: "origin".into(),
+        default_branch: "main".into(),
+        server_generation: 1,
+        advertised_heads: BTreeMap::from([("main".into(), fixture.base.clone())]),
+        last_applied_heads: BTreeMap::from([("main".into(), fixture.base)]),
+        active_branch: Some("main".into()),
+        workspace_generation: 1,
+        state: "CURRENT".into(),
+        durability: "COMMITTED_UNPUBLISHED".into(),
+        conflict: None,
+        last_error: None,
+        service: None,
+        checkout_id: None,
+        extra: BTreeMap::new(),
+    };
+    let root = fixture.root.path().join("state");
+    let paths = StatePaths {
+        config: root.join("config.json"),
+        credentials: root.join("credentials.json"),
+        keys: root.join("keys"),
+        catalog: root.join("catalog.json"),
+        transactions: root.join("transactions"),
+        daemon_lock: root.join("daemon.lock"),
+        socket: root.join("daemon.sock"),
+        root,
+    };
+    let daemon = ResyncDaemon::from_parts(
+        paths,
+        Config::default(),
+        LocalCatalog {
+            catalog_generation: 1,
+            projects: vec![project],
+        },
+        Duration::from_secs(10),
+        Duration::from_secs(60),
+    )?;
+    let runtime = resync::daemon::runtime()?;
+    runtime.block_on(async {
+        let access = daemon
+            .handle(serde_json::json!({
+                "method": "acquireAccess",
+                "project_id": "prj_publication_gate",
+                "session_id": "session",
+                "call_id": "active-tool"
+            }))
+            .await?;
+        let publisher = daemon.clone();
+        let publication = tokio::spawn(async move {
+            publisher
+                .handle(serde_json::json!({
+                    "method": "publish",
+                    "project_id": "prj_publication_gate"
+                }))
+                .await
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), publication)
+            .await
+            .expect("network publication must not wait for active workspace leases")
+            .expect("publication task panicked")?;
+        assert_eq!(result["outcome"], "published");
+        daemon
+            .handle(serde_json::json!({
+                "method": "releaseAccess",
+                "lease_id": access["lease_id"]
+            }))
+            .await?;
+        anyhow::Ok(())
+    })
+}
+
+#[test]
 fn failed_automatic_reconciliation_grants_access_until_explicit_sync() -> anyhow::Result<()> {
     let fixture = fixture()?;
     fs::write(fixture.local.join("file"), "local\n")?;
@@ -59,20 +235,47 @@ fn failed_automatic_reconciliation_grants_access_until_explicit_sync() -> anyhow
     )?;
     let runtime = resync::daemon::runtime()?;
     runtime.block_on(async {
-        for call in ["first", "second"] {
-            let access = daemon
+        let first = daemon
+            .handle(serde_json::json!({
+                "method": "acquireAccess",
+                "project_id": "prj_reconciliation_mode",
+                "session_id": "session",
+                "call_id": "first"
+            }))
+            .await?;
+        assert_eq!(first["granted"], true);
+        assert_eq!(fs::read_to_string(fixture.local.join("file"))?, "local\n");
+        if let Some(lease_id) = first["lease_id"].as_str() {
+            daemon
                 .handle(serde_json::json!({
-                    "method": "acquireAccess",
-                    "project_id": "prj_reconciliation_mode",
-                    "session_id": "session",
-                    "call_id": call
+                    "method": "releaseAccess",
+                    "lease_id": lease_id
                 }))
                 .await?;
-            assert_eq!(access["granted"], true);
-            assert_eq!(access["reconciliation_mode"], true);
-            assert_eq!(access["lease_id"], serde_json::Value::Null);
-            assert_eq!(fs::read_to_string(fixture.local.join("file"))?, "local\n");
         }
+        for _ in 0..100 {
+            if daemon
+                .project_snapshot("prj_reconciliation_mode")
+                .await?
+                .state
+                == "CONFLICTED"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let second = daemon
+            .handle(serde_json::json!({
+                "method": "acquireAccess",
+                "project_id": "prj_reconciliation_mode",
+                "session_id": "session",
+                "call_id": "second"
+            }))
+            .await?;
+        assert_eq!(second["granted"], true);
+        assert_eq!(second["reconciliation_mode"], true);
+        assert_eq!(second["lease_id"], serde_json::Value::Null);
+        assert_eq!(fs::read_to_string(fixture.local.join("file"))?, "local\n");
         assert_eq!(fs::read_dir(&paths.transactions)?.count(), 1);
 
         git(

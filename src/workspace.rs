@@ -1,5 +1,5 @@
 use crate::hook_dispatcher::{
-    ensure_workspace_dispatcher, is_legacy_workspace_command, shell_quote,
+    ensure_workspace_dispatcher, is_reposync_workspace_command, shell_quote,
 };
 use crate::state::{load_catalog, state_paths, write_json};
 use anyhow::{Context, Result, bail, ensure};
@@ -186,7 +186,7 @@ pub fn install_hooks(root: &Path) -> Result<Value> {
                     command_found = true;
                     return true;
                 }
-                !is_legacy_workspace_command(value, &workspace.manifest_path)
+                !is_reposync_workspace_command(value)
             });
             !handlers.is_empty()
         });

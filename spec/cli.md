@@ -37,6 +37,7 @@ peer
 
 daemon
 doctor
+upgrade                              # converge launcher, daemon, adapters, and caches to one build
 install-adapters [PROJECT_ID]        # repair all local projects, or one selected project
 workspace
   install-hooks [WORKSPACE_ROOT]     # install one explicit multi-project Codex dispatcher
@@ -52,6 +53,12 @@ reconciles the active branch, and flushes pending work without changing
 project, checkout, or device identity. An ordinary `git commit` durably queues
 publication automatically. `project publish` is an explicit retry/flush
 command and is not part of the normal workflow.
+
+`upgrade` stages the current verified executable in a build-identity directory,
+atomically repoints the stable launcher, restarts and verifies the daemon by
+executable fingerprint, repairs every catalog adapter, removes obsolete
+package-manager installations, and prunes old managed builds only after no
+process references them. Repeating the command MUST make no further changes.
 
 Examples:
 

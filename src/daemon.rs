@@ -12,14 +12,15 @@ use crate::state::{
     write_json,
 };
 use crate::transaction::{
-    ReconcileResult, clear_resolved_conflicts, reconcile_workspace_with_retention,
-    transaction_retention,
+    PreparedReconciliation, ReconcileResult, clear_resolved_conflicts,
+    discard_prepared_reconciliation, install_prepared_reconciliation,
+    prepare_reconciliation_with_retention, transaction_retention,
 };
 use anyhow::{Context, Result, bail};
 use rand::Rng;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -35,7 +36,16 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[derive(Debug, Default)]
 struct GateState {
     exclusive: bool,
+    next_exclusive: u64,
+    exclusive_queue: VecDeque<u64>,
     leases: HashMap<String, Value>,
+    leases_by_call: HashMap<LeaseCall, String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LeaseCall {
+    session_id: String,
+    call_id: String,
 }
 
 #[derive(Debug)]
@@ -55,23 +65,25 @@ impl LeaseGate {
     }
 
     async fn begin_exclusive(&self) {
-        // First serialize exclusive owners. Only the task that changes the flag
-        // from false to true may proceed to the lease-draining phase.
+        let ticket = {
+            let mut state = self.state.lock().await;
+            let ticket = state.next_exclusive;
+            state.next_exclusive = state.next_exclusive.wrapping_add(1);
+            state.exclusive_queue.push_back(ticket);
+            ticket
+        };
         loop {
             let notified = self.changed.notified();
             {
                 let mut state = self.state.lock().await;
-                if !state.exclusive {
+                if !state.exclusive
+                    && state.leases.is_empty()
+                    && state.exclusive_queue.front() == Some(&ticket)
+                {
+                    state.exclusive_queue.pop_front();
                     state.exclusive = true;
-                    break;
+                    return;
                 }
-            }
-            notified.await;
-        }
-        loop {
-            let notified = self.changed.notified();
-            if self.state.lock().await.leases.is_empty() {
-                return;
             }
             notified.await;
         }
@@ -88,8 +100,19 @@ impl LeaseGate {
             {
                 let mut state = self.state.lock().await;
                 if !state.exclusive {
+                    let call = lease_call(&metadata);
+                    if let Some(id) = call
+                        .as_ref()
+                        .and_then(|call| state.leases_by_call.get(call))
+                        .filter(|id| state.leases.contains_key(*id))
+                    {
+                        return id.clone();
+                    }
                     let id = Uuid::new_v4().to_string();
                     state.leases.insert(id.clone(), metadata);
+                    if let Some(call) = call {
+                        state.leases_by_call.insert(call, id.clone());
+                    }
                     let gate = Arc::clone(self);
                     let lease = id.clone();
                     tokio::spawn(async move {
@@ -104,12 +127,28 @@ impl LeaseGate {
     }
 
     async fn release(&self, id: &str) -> bool {
-        let removed = self.state.lock().await.leases.remove(id).is_some();
+        let removed = {
+            let mut state = self.state.lock().await;
+            let removed = state.leases.remove(id);
+            if let Some(call) = removed.as_ref().and_then(lease_call)
+                && state.leases_by_call.get(&call).map(String::as_str) == Some(id)
+            {
+                state.leases_by_call.remove(&call);
+            }
+            removed.is_some()
+        };
         if removed {
             self.changed.notify_waiters();
         }
         removed
     }
+}
+
+fn lease_call(metadata: &Value) -> Option<LeaseCall> {
+    Some(LeaseCall {
+        session_id: metadata.get("sessionId")?.as_str()?.to_owned(),
+        call_id: metadata.get("callId")?.as_str()?.to_owned(),
+    })
 }
 
 struct DaemonInner {
@@ -119,7 +158,6 @@ struct DaemonInner {
     catalog: Mutex<LocalCatalog>,
     gates: StdMutex<HashMap<String, Arc<LeaseGate>>>,
     background_reconciliations: StdMutex<HashSet<String>>,
-    lease_projects: Mutex<HashMap<String, String>>,
     publications: Mutex<PublicationQueue>,
     publication_processing: Mutex<()>,
     poll_interval: Duration,
@@ -129,6 +167,23 @@ struct DaemonInner {
 #[derive(Clone)]
 pub struct ResyncDaemon {
     inner: Arc<DaemonInner>,
+}
+
+enum ProjectReconciliation {
+    Complete {
+        staged: Box<LocalProject>,
+        result: Box<ReconcileResult>,
+        expected_generation: u64,
+        branch: String,
+        target: Option<String>,
+    },
+    Prepared {
+        staged: Box<LocalProject>,
+        prepared: Box<PreparedReconciliation>,
+        expected_generation: u64,
+        branch: String,
+        target: String,
+    },
 }
 
 impl ResyncDaemon {
@@ -151,7 +206,6 @@ impl ResyncDaemon {
                 catalog: Mutex::new(catalog),
                 gates: StdMutex::new(HashMap::new()),
                 background_reconciliations: StdMutex::new(HashSet::new()),
-                lease_projects: Mutex::new(HashMap::new()),
                 publications: Mutex::new(publications),
                 publication_processing: Mutex::new(()),
                 poll_interval,
@@ -178,7 +232,6 @@ impl ResyncDaemon {
                 catalog: Mutex::new(catalog),
                 gates: StdMutex::new(HashMap::new()),
                 background_reconciliations: StdMutex::new(HashSet::new()),
-                lease_projects: Mutex::new(HashMap::new()),
                 publications: Mutex::new(publications),
                 publication_processing: Mutex::new(()),
                 poll_interval,
@@ -327,47 +380,44 @@ impl ResyncDaemon {
         }
         let daemon = self.clone();
         tokio::spawn(async move {
-            if let Err(error) = daemon.reconcile_exclusive(&project_id).await {
-                let mut catalog = daemon.inner.catalog.lock().await;
-                if let Ok(project) = find_project_mut(&mut catalog, &project_id) {
-                    if project.state == "RECONCILING" {
-                        project.state = "REMOTE_AHEAD".into();
+            let retry = match daemon.reconcile_exclusive(&project_id).await {
+                Ok(result) => result.outcome == "retry",
+                Err(error) => {
+                    let mut catalog = daemon.inner.catalog.lock().await;
+                    if let Ok(project) = find_project_mut(&mut catalog, &project_id) {
+                        if project.state == "RECONCILING" {
+                            project.state = "REMOTE_AHEAD".into();
+                        }
+                        project.last_error = Some(format!("{error:#}"));
+                        let _ = daemon.persist(&catalog).await;
                     }
-                    project.last_error = Some(format!("{error:#}"));
-                    let _ = daemon.persist(&catalog).await;
+                    false
                 }
-            }
+            };
             daemon
                 .inner
                 .background_reconciliations
                 .lock()
                 .expect("background reconciliation lock poisoned")
                 .remove(&project_id);
+            if retry {
+                daemon.schedule_reconcile(project_id);
+            }
         });
     }
 
-    async fn reconcile_exclusive(&self, project_id: &str) -> Result<ReconcileResult> {
-        let gate = self.gate(project_id);
-        gate.begin_exclusive().await;
-        let result = async {
-            let mut catalog = self.inner.catalog.lock().await;
-            let project = find_project_mut(&mut catalog, project_id)?;
-            let result = self.reconcile_project(project);
-            self.persist(&catalog).await?;
-            result
-        }
-        .await;
-        gate.end_exclusive().await;
-        result
-    }
-
-    fn reconcile_project(&self, project: &mut LocalProject) -> Result<ReconcileResult> {
+    fn prepare_project_reconciliation(
+        &self,
+        mut project: LocalProject,
+    ) -> Result<ProjectReconciliation> {
+        let expected_generation = project.workspace_generation;
         let retention = transaction_retention(&self.inner.paths.root);
         let branch = current_branch(&project.local_path).map_err(|_| {
             anyhow::anyhow!("detached or unborn HEAD is unsupported in RepoSync V1")
         })?;
         project.active_branch = Some(branch.clone());
-        let Some(target) = project.advertised_heads.get(&branch).cloned() else {
+        let target = project.advertised_heads.get(&branch).cloned();
+        let Some(target_oid) = target.clone() else {
             project.state = "CURRENT".into();
             project.conflict = None;
             clear_resolved_conflicts(
@@ -375,11 +425,21 @@ impl ResyncDaemon {
                 &project.local_path,
                 retention,
             )?;
-            return Ok(simple_outcome("current"));
+            return Ok(ProjectReconciliation::Complete {
+                staged: Box::new(project),
+                result: Box::new(simple_outcome("current")),
+                expected_generation,
+                branch,
+                target,
+            });
         };
         let snapshot = capture_workspace(&project.local_path)?;
-        if snapshot.head == target {
-            project.last_applied_heads.insert(branch, target);
+        if snapshot.head == target_oid
+            || is_ancestor(&project.local_path, &target_oid, &snapshot.head)?
+        {
+            project
+                .last_applied_heads
+                .insert(branch.clone(), target_oid);
             project.state = "CURRENT".into();
             project.conflict = None;
             clear_resolved_conflicts(
@@ -387,25 +447,19 @@ impl ResyncDaemon {
                 &project.local_path,
                 retention,
             )?;
-            return Ok(simple_outcome("current"));
+            return Ok(ProjectReconciliation::Complete {
+                staged: Box::new(project),
+                result: Box::new(simple_outcome("current")),
+                expected_generation,
+                branch,
+                target,
+            });
         }
-        let target_is_base = is_ancestor(&project.local_path, &target, &snapshot.head)?;
-        if target_is_base {
-            project.last_applied_heads.insert(branch, target);
-            project.state = "CURRENT".into();
-            project.conflict = None;
-            clear_resolved_conflicts(
-                &self.inner.paths.transactions,
-                &project.local_path,
-                retention,
-            )?;
-            return Ok(simple_outcome("current"));
-        }
-        let head_is_base = is_ancestor(&project.local_path, &snapshot.head, &target)?;
+        let head_is_base = is_ancestor(&project.local_path, &snapshot.head, &target_oid)?;
         let mut previous = project.last_applied_heads.get(&branch).cloned();
-        if previous.is_none() || previous.as_deref() == Some(&target) {
+        if previous.is_none() || previous.as_deref() == Some(&target_oid) {
             if head_is_base {
-                previous = Some(snapshot.head.clone());
+                previous = Some(snapshot.head);
             } else {
                 let detail = format!("local and hosted histories for branch {branch} diverge");
                 project.state = "CONFLICTED".into();
@@ -414,43 +468,174 @@ impl ResyncDaemon {
                     detail: detail.clone(),
                     paths: Vec::new(),
                 });
-                return Ok(ReconcileResult {
-                    outcome: "conflict".into(),
-                    detail: Some(detail),
-                    ..simple_outcome("")
+                return Ok(ProjectReconciliation::Complete {
+                    staged: Box::new(project),
+                    result: Box::new(ReconcileResult {
+                        outcome: "conflict".into(),
+                        detail: Some(detail),
+                        ..simple_outcome("")
+                    }),
+                    expected_generation,
+                    branch,
+                    target,
                 });
             }
         }
         project.state = "RECONCILING".into();
-        let result = reconcile_workspace_with_retention(
+        let prepared = prepare_reconciliation_with_retention(
             &project.local_path,
             previous.as_deref().unwrap(),
-            &target,
+            &target_oid,
             Some(&self.inner.paths.transactions),
             retention,
         )?;
-        if result.outcome == "applied" {
-            project.last_applied_heads.insert(branch, target);
-            project.workspace_generation += 1;
-            project.state = "CURRENT".into();
-            project.conflict = None;
-            clear_resolved_conflicts(
-                &self.inner.paths.transactions,
-                &project.local_path,
-                retention,
-            )?;
-        } else if result.outcome == "conflict" {
-            project.state = "CONFLICTED".into();
-            project.conflict = Some(crate::state::Conflict {
-                kind: "reconciliation".into(),
-                detail: result
-                    .detail
-                    .clone()
-                    .unwrap_or_else(|| "reconciliation conflict".into()),
-                paths: result.paths.clone(),
-            });
+        match prepared {
+            PreparedReconciliation::Complete(result) => {
+                self.apply_reconciliation_result(&mut project, &branch, &target_oid, &result)?;
+                Ok(ProjectReconciliation::Complete {
+                    staged: Box::new(project),
+                    result,
+                    expected_generation,
+                    branch,
+                    target,
+                })
+            }
+            prepared @ PreparedReconciliation::Ready(_) => Ok(ProjectReconciliation::Prepared {
+                staged: Box::new(project),
+                prepared: Box::new(prepared),
+                expected_generation,
+                branch,
+                target: target_oid,
+            }),
         }
-        Ok(result)
+    }
+
+    fn apply_reconciliation_result(
+        &self,
+        project: &mut LocalProject,
+        branch: &str,
+        target: &str,
+        result: &ReconcileResult,
+    ) -> Result<()> {
+        let retention = transaction_retention(&self.inner.paths.root);
+        match result.outcome.as_str() {
+            "applied" => {
+                project
+                    .last_applied_heads
+                    .insert(branch.into(), target.into());
+                project.workspace_generation += 1;
+                project.state = "CURRENT".into();
+                project.conflict = None;
+                clear_resolved_conflicts(
+                    &self.inner.paths.transactions,
+                    &project.local_path,
+                    retention,
+                )?;
+            }
+            "current" => {
+                project
+                    .last_applied_heads
+                    .insert(branch.into(), target.into());
+                project.state = "CURRENT".into();
+                project.conflict = None;
+                clear_resolved_conflicts(
+                    &self.inner.paths.transactions,
+                    &project.local_path,
+                    retention,
+                )?;
+            }
+            "conflict" => {
+                project.state = "CONFLICTED".into();
+                project.conflict = Some(crate::state::Conflict {
+                    kind: "reconciliation".into(),
+                    detail: result
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| "reconciliation conflict".into()),
+                    paths: result.paths.clone(),
+                });
+            }
+            "retry" => {
+                project.state = "REMOTE_AHEAD".into();
+                project.conflict = None;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn merge_reconciliation_state(current: &mut LocalProject, staged: LocalProject) {
+        current.active_branch = staged.active_branch;
+        current.last_applied_heads = staged.last_applied_heads;
+        current.workspace_generation = staged.workspace_generation;
+        current.state = staged.state;
+        current.conflict = staged.conflict;
+    }
+
+    async fn reconcile_exclusive(&self, project_id: &str) -> Result<ReconcileResult> {
+        let staged = {
+            let catalog = self.inner.catalog.lock().await;
+            find_project(&catalog, project_id)?.clone()
+        };
+        match self.prepare_project_reconciliation(staged)? {
+            ProjectReconciliation::Complete {
+                staged,
+                result,
+                expected_generation,
+                branch,
+                target,
+            } => {
+                let mut catalog = self.inner.catalog.lock().await;
+                let project = find_project_mut(&mut catalog, project_id)?;
+                if project.workspace_generation != expected_generation
+                    || project.advertised_heads.get(&branch) != target.as_ref()
+                {
+                    return Ok(ReconcileResult {
+                        outcome: "retry".into(),
+                        detail: Some("reconciliation inputs changed during preparation".into()),
+                        ..simple_outcome("")
+                    });
+                }
+                Self::merge_reconciliation_state(project, *staged);
+                self.persist(&catalog).await?;
+                Ok(*result)
+            }
+            ProjectReconciliation::Prepared {
+                staged,
+                prepared,
+                expected_generation,
+                branch,
+                target,
+            } => {
+                let gate = self.gate(project_id);
+                gate.begin_exclusive().await;
+                let mut prepared = Some(*prepared);
+                let result = async {
+                    let mut catalog = self.inner.catalog.lock().await;
+                    let project = find_project_mut(&mut catalog, project_id)?;
+                    if project.workspace_generation != expected_generation
+                        || project.advertised_heads.get(&branch) != Some(&target)
+                        || current_branch(&project.local_path).ok().as_deref() != Some(&branch)
+                    {
+                        discard_prepared_reconciliation(prepared.take().unwrap())?;
+                        return Ok(ReconcileResult {
+                            outcome: "retry".into(),
+                            detail: Some("reconciliation inputs changed during preparation".into()),
+                            ..simple_outcome("")
+                        });
+                    }
+                    let installed = install_prepared_reconciliation(prepared.take().unwrap())?;
+                    let mut staged = *staged;
+                    self.apply_reconciliation_result(&mut staged, &branch, &target, &installed)?;
+                    Self::merge_reconciliation_state(project, staged);
+                    self.persist(&catalog).await?;
+                    Ok(installed)
+                }
+                .await;
+                gate.end_exclusive().await;
+                result
+            }
+        }
     }
 
     async fn ensure_branch_transition(&self, project_id: &str) -> Result<()> {
@@ -504,17 +689,8 @@ impl ResyncDaemon {
         };
         let gate = self.gate(project_id);
         let reconciliation = if should_reconcile {
-            gate.begin_exclusive().await;
-            let result = async {
-                let mut catalog = self.inner.catalog.lock().await;
-                let project = find_project_mut(&mut catalog, project_id)?;
-                let result = self.reconcile_project(project);
-                self.persist(&catalog).await?;
-                result
-            }
-            .await;
-            gate.end_exclusive().await;
-            result?
+            self.schedule_reconcile(project_id.into());
+            simple_outcome("deferred")
         } else {
             simple_outcome("deferred")
         };
@@ -530,11 +706,6 @@ impl ResyncDaemon {
                     "sessionId": request.get("session_id"), "callId": request.get("call_id")
                 }))
                 .await;
-            self.inner
-                .lease_projects
-                .lock()
-                .await
-                .insert(lease_id.clone(), project_id.into());
             Some(lease_id)
         };
         let catalog = self.inner.catalog.lock().await;
@@ -567,33 +738,28 @@ impl ResyncDaemon {
 
     async fn release(&self, request: &Value) -> Result<Value> {
         let lease_id = string_field(request, "lease_id")?;
-        let project_id = self
+        let gates = self
             .inner
-            .lease_projects
+            .gates
             .lock()
-            .await
-            .remove(lease_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown or already released lease"))?;
-        if !self.gate(&project_id).release(lease_id).await {
-            bail!("unknown or already released lease");
+            .expect("gate lock poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for gate in gates {
+            if gate.release(lease_id).await {
+                return Ok(json!({ "released": true }));
+            }
         }
-        Ok(json!({ "released": true }))
+        Ok(json!({ "released": false }))
     }
 
     async fn sync(&self, request: &Value) -> Result<Value> {
         let project_id = string_field(request, "project_id")?;
         self.refresh().await?;
-        let gate = self.gate(project_id);
-        gate.begin_exclusive().await;
-        let result = {
-            let mut catalog = self.inner.catalog.lock().await;
-            let project = find_project_mut(&mut catalog, project_id)?;
-            let result = self.reconcile_project(project);
-            self.persist(&catalog).await?;
-            result
-        };
-        gate.end_exclusive().await;
-        Ok(serde_json::to_value(result?)?)
+        Ok(serde_json::to_value(
+            self.reconcile_exclusive(project_id).await?,
+        )?)
     }
 
     async fn enqueue_publication(
@@ -713,14 +879,10 @@ impl ResyncDaemon {
     }
 
     async fn deliver_publication(&self, publication: &Publication) -> Result<()> {
-        let gate = self.gate(&publication.project_id);
-        gate.begin_exclusive().await;
-        let result = self.deliver_publication_exclusive(publication).await;
-        gate.end_exclusive().await;
-        result
+        self.deliver_publication_unlocked(publication).await
     }
 
-    async fn deliver_publication_exclusive(&self, initial: &Publication) -> Result<()> {
+    async fn deliver_publication_unlocked(&self, initial: &Publication) -> Result<()> {
         for _ in 0..5 {
             let mut publication = {
                 let queue = self.inner.publications.lock().await;
@@ -762,7 +924,7 @@ impl ResyncDaemon {
                         publication.branch
                     );
                 }
-                let candidate = {
+                {
                     let mut catalog = self.inner.catalog.lock().await;
                     let project = find_project_mut(&mut catalog, &publication.project_id)?;
                     match &remote_head {
@@ -775,22 +937,27 @@ impl ResyncDaemon {
                             project.advertised_heads.remove(&publication.branch);
                         }
                     }
-                    let reconciliation = self.reconcile_project(project)?;
-                    if reconciliation.outcome == "conflict" {
-                        self.persist(&catalog).await?;
-                        bail!("publication is blocked by a reconciliation conflict");
-                    }
-                    let candidate = git(
-                        &project.local_path,
-                        ["rev-parse", "HEAD"],
-                        RunOptions::default(),
-                    )?
-                    .stdout
-                    .trim()
-                    .to_owned();
                     self.persist(&catalog).await?;
-                    candidate
+                }
+                let reconciliation = self.reconcile_exclusive(&publication.project_id).await?;
+                if reconciliation.outcome == "conflict" {
+                    bail!("publication is blocked by a reconciliation conflict");
+                }
+                if reconciliation.outcome == "retry" {
+                    continue;
+                }
+                let project = {
+                    let catalog = self.inner.catalog.lock().await;
+                    find_project(&catalog, &publication.project_id)?.clone()
                 };
+                let candidate = git(
+                    &project.local_path,
+                    ["rev-parse", "HEAD"],
+                    RunOptions::default(),
+                )?
+                .stdout
+                .trim()
+                .to_owned();
                 let mut queue = self.inner.publications.lock().await;
                 let queued = queue
                     .publications
@@ -1705,6 +1872,33 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), &mut second)
             .await
             .expect("second owner should acquire after release")
+            .unwrap();
+        gate.end_exclusive().await;
+    }
+
+    #[tokio::test]
+    async fn pending_exclusive_work_does_not_close_admission_behind_an_orphan() {
+        let gate = LeaseGate::new(Duration::from_secs(60));
+        let orphan = gate
+            .activity(json!({ "sessionId": "session", "callId": "orphan" }))
+            .await;
+        let exclusive_gate = Arc::clone(&gate);
+        let mut exclusive = tokio::spawn(async move { exclusive_gate.begin_exclusive().await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!exclusive.is_finished());
+
+        let admitted = tokio::time::timeout(
+            Duration::from_millis(100),
+            gate.activity(json!({ "sessionId": "session", "callId": "later" })),
+        )
+        .await
+        .expect("pending exclusive work must leave new tool calls available");
+
+        assert!(gate.release(&admitted).await);
+        assert!(gate.release(&orphan).await);
+        tokio::time::timeout(Duration::from_secs(1), &mut exclusive)
+            .await
+            .expect("exclusive work should proceed after activities drain")
             .unwrap();
         gate.end_exclusive().await;
     }

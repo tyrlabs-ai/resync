@@ -3,7 +3,7 @@ use crate::credentials::{
     canonical_origin, erase_credential, load_credential, remove_device_identity,
 };
 use crate::daemon::{daemon_rpc, ensure_daemon_supervision, run_daemon, runtime};
-use crate::hook_dispatcher::{ensure_project_dispatcher, is_legacy_project_command, shell_quote};
+use crate::hook_dispatcher::{ensure_project_dispatcher, is_reposync_project_command, shell_quote};
 use crate::identity::{clear_identity, read_identity, repository_root, write_identity};
 use crate::peer::{AcceptOptions, peer_accept, peer_sync};
 use crate::process::{RunOptions, git, run as run_process};
@@ -26,12 +26,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 const REPOSYNC_SKILL: &str = include_str!("../skills/reposync/SKILL.md");
 const REPOSYNC_SKILL_OPENAI_METADATA: &str = include_str!("../skills/reposync/agents/openai.yaml");
@@ -83,6 +83,13 @@ enum Command {
     },
     #[command(about = "Check Git, provider, daemon, identity, and credential state")]
     Doctor,
+    #[command(about = "Atomically converge this machine onto one RepoSync build")]
+    Upgrade,
+    #[command(name = "activate-upgrade", hide = true)]
+    ActivateUpgrade {
+        #[arg(long)]
+        install_root: PathBuf,
+    },
     #[command(about = "Prune obsolete transaction records and recovery refs")]
     Gc {
         #[arg(long, help = "Report reclaimable artifacts without changing them")]
@@ -320,6 +327,8 @@ fn preprocess_arguments() -> Vec<String> {
         "peer",
         "daemon",
         "doctor",
+        "upgrade",
+        "activate-upgrade",
         "gc",
         "transaction-debug",
         "install-adapters",
@@ -391,6 +400,8 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             Ok(None)
         }
         Command::Doctor => Ok(Some(doctor())),
+        Command::Upgrade => Ok(Some(upgrade_command()?)),
+        Command::ActivateUpgrade { install_root } => Ok(Some(activate_upgrade(&install_root)?)),
         Command::Gc { dry_run } => Ok(Some(transaction_gc(dry_run)?)),
         Command::TransactionDebug { command } => Ok(Some(transaction_debug(command)?)),
         Command::InstallAdapters { project_id } => {
@@ -891,6 +902,340 @@ fn peer(command: PeerCommand) -> Result<Value> {
     }
 }
 
+struct ManagedBuild {
+    executable: PathBuf,
+    build_id: String,
+}
+
+fn file_fingerprint(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("open RepoSync executable {}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn stage_managed_build(source: &Path, install_root: &Path) -> Result<ManagedBuild> {
+    let fingerprint = file_fingerprint(source)?;
+    let build_id = format!("{}-{}", env!("CARGO_PKG_VERSION"), &fingerprint[..16]);
+    let directory = install_root.join("share/resync/bin").join(&build_id);
+    fs::create_dir_all(&directory)?;
+    let executable = directory.join("resync");
+    if file_fingerprint(&executable).ok().as_deref() != Some(&fingerprint) {
+        let temporary = directory.join(format!("resync.tmp.{}", std::process::id()));
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        fs::copy(source, &temporary).with_context(|| {
+            format!(
+                "stage RepoSync build from {} to {}",
+                source.display(),
+                temporary.display()
+            )
+        })?;
+        #[cfg(unix)]
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
+        if file_fingerprint(&temporary)? != fingerprint {
+            bail!("staged RepoSync build failed fingerprint validation");
+        }
+        fs::rename(&temporary, &executable)
+            .with_context(|| format!("activate RepoSync build {}", executable.display()))?;
+    }
+    activate_managed_launcher(install_root, &executable)?;
+    Ok(ManagedBuild {
+        executable,
+        build_id,
+    })
+}
+
+fn activate_managed_launcher(install_root: &Path, executable: &Path) -> Result<()> {
+    let bin = install_root.join("bin");
+    fs::create_dir_all(&bin)?;
+    let launcher = bin.join("resync");
+    let temporary = bin.join(format!("resync.tmp.{}", std::process::id()));
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    symlink(executable, &temporary)?;
+    #[cfg(not(unix))]
+    fs::copy(executable, &temporary)?;
+    fs::rename(&temporary, &launcher)
+        .with_context(|| format!("activate stable RepoSync launcher {}", launcher.display()))?;
+    Ok(())
+}
+
+fn prune_managed_builds(
+    install_root: &Path,
+    keep_executable: &Path,
+    referenced_executables: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let builds = install_root.join("share/resync/bin");
+    let keep = keep_executable
+        .parent()
+        .context("managed RepoSync executable has no parent directory")?;
+    let Ok(entries) = fs::read_dir(&builds) else {
+        return Ok(Vec::new());
+    };
+    let mut obsolete = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path != keep)
+        .collect::<Vec<_>>();
+    obsolete.sort();
+    for path in &obsolete {
+        if referenced_executables
+            .iter()
+            .any(|executable| executable.starts_with(path))
+        {
+            bail!(
+                "obsolete RepoSync build {} is still referenced by a running process",
+                path.display()
+            );
+        }
+    }
+    for path in &obsolete {
+        if path.is_dir() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(obsolete)
+}
+
+fn running_executables() -> Vec<PathBuf> {
+    let Ok(processes) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    processes
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        })
+        .filter_map(|entry| fs::read_link(entry.path().join("exe")).ok())
+        .collect()
+}
+
+fn managed_install_root() -> Result<PathBuf> {
+    Ok(std::env::var_os("RESYNC_INSTALL_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or(
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is unavailable")?
+                .join(".local"),
+        ))
+}
+
+fn upgrade_command() -> Result<Value> {
+    let install_root = managed_install_root()?;
+    let managed = stage_managed_build(&std::env::current_exe()?, &install_root)?;
+    let activated = run_process(
+        &managed.executable,
+        [
+            "activate-upgrade".into(),
+            "--install-root".into(),
+            install_root.to_string_lossy().into_owned(),
+        ],
+        RunOptions::default(),
+    )?;
+    serde_json::from_str(&activated.stdout)
+        .context("activated RepoSync build returned invalid JSON")
+}
+
+fn remove_legacy_package_installs(install_root: &Path) -> Result<Vec<String>> {
+    let package = "@tyrlabs-ai/resync";
+    let mut removed = Vec::new();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is unavailable")?;
+    let nvm = home.join(".nvm/versions/node");
+    if let Ok(versions) = fs::read_dir(nvm) {
+        for version in versions.filter_map(|entry| entry.ok()) {
+            let manifest = version
+                .path()
+                .join("lib/node_modules/@tyrlabs-ai/resync/package.json");
+            if !manifest.exists() {
+                continue;
+            }
+            let npm = version.path().join("bin/npm");
+            let result = run_process(
+                &npm,
+                ["uninstall", "--global", package],
+                RunOptions {
+                    allow_failure: true,
+                    ..RunOptions::default()
+                },
+            )?;
+            if result.code != 0 || manifest.exists() {
+                bail!(
+                    "could not remove obsolete NVM RepoSync installation at {}: {}",
+                    manifest.display(),
+                    result.stderr.trim()
+                );
+            }
+            removed.push(format!("npm:{}", version.path().display()));
+        }
+    }
+    let local_manifest = install_root.join("lib/node_modules/@tyrlabs-ai/resync/package.json");
+    if local_manifest.exists() {
+        let result = run_process(
+            "npm",
+            [
+                "--prefix".into(),
+                install_root.to_string_lossy().into_owned(),
+                "uninstall".into(),
+                "--global".into(),
+                package.into(),
+            ],
+            RunOptions {
+                allow_failure: true,
+                ..RunOptions::default()
+            },
+        )?;
+        if result.code != 0 || local_manifest.exists() {
+            bail!(
+                "could not remove obsolete npm RepoSync installation at {}: {}",
+                local_manifest.display(),
+                result.stderr.trim()
+            );
+        }
+        removed.push(format!("npm-prefix:{}", install_root.display()));
+    }
+    let vite_plus = run_process(
+        "vp",
+        ["list", "--global"],
+        RunOptions {
+            allow_failure: true,
+            ..RunOptions::default()
+        },
+    );
+    if vite_plus
+        .as_ref()
+        .is_ok_and(|result| result.stdout.contains(package))
+    {
+        let result = run_process(
+            "vp",
+            ["remove", "--global", package],
+            RunOptions {
+                allow_failure: true,
+                ..RunOptions::default()
+            },
+        )?;
+        if result.code != 0 {
+            bail!("could not remove Vite Plus RepoSync installation");
+        }
+        removed.push("vite-plus".into());
+    }
+    Ok(removed)
+}
+
+fn activate_upgrade(install_root: &Path) -> Result<Value> {
+    let current = std::env::current_exe()?;
+    let managed = stage_managed_build(&current, install_root)?;
+    if fs::canonicalize(&current)? != fs::canonicalize(&managed.executable)? {
+        bail!("upgrade activation must run from the staged canonical build");
+    }
+    let supervision = ensure_daemon_supervision(true)?;
+    let ping = daemon_rpc(&json!({ "method": "ping" }))?;
+    let fingerprint = file_fingerprint(&managed.executable)?;
+    if ping.get("binaryId").and_then(Value::as_str) != Some(&fingerprint) {
+        bail!("RepoSync daemon did not activate the staged build identity");
+    }
+    let adapters = install_adapters_command(None)?;
+    let removed_packages = remove_legacy_package_installs(install_root)?;
+    activate_managed_launcher(install_root, &managed.executable)?;
+    let removed_builds =
+        prune_managed_builds(install_root, &managed.executable, &running_executables())?;
+    Ok(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol": crate::protocol::PROTOCOL_VERSION,
+        "buildId": managed.build_id,
+        "binaryId": fingerprint,
+        "executable": managed.executable,
+        "launcher": install_root.join("bin/resync"),
+        "daemonPid": ping.get("pid"),
+        "daemonSupervision": supervision,
+        "adapterRepair": adapters,
+        "removedPackageInstalls": removed_packages,
+        "removedBuilds": removed_builds,
+    }))
+}
+
+fn single_build_health() -> Result<String> {
+    let install_root = managed_install_root()?;
+    let current = fs::canonicalize(std::env::current_exe()?)?;
+    let launcher = fs::canonicalize(install_root.join("bin/resync"))?;
+    if launcher != current {
+        bail!("stable launcher and current executable resolve to different builds");
+    }
+    let build_root = install_root.join("share/resync/bin");
+    let builds = fs::read_dir(&build_root)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().join("resync").is_file())
+        .collect::<Vec<_>>();
+    if builds.len() != 1 {
+        bail!(
+            "managed build cache contains {} RepoSync builds",
+            builds.len()
+        );
+    }
+    let fingerprint = file_fingerprint(&current)?;
+    let ping = rpc(&json!({ "method": "ping" }), None)?;
+    if ping.get("binaryId").and_then(Value::as_str) != Some(&fingerprint) {
+        bail!("daemon and stable launcher have different build identities");
+    }
+    if let Some(pid) = ping.get("pid").and_then(Value::as_u64) {
+        let daemon = fs::read_link(format!("/proc/{pid}/exe"))?;
+        if fs::canonicalize(daemon)? != current {
+            bail!("daemon executable and stable launcher resolve to different builds");
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            let candidate = directory.join("resync");
+            if candidate.exists() && fs::canonicalize(candidate)? != current {
+                bail!("PATH contains a different RepoSync executable");
+            }
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is unavailable")?;
+    let local_manifest = install_root.join("lib/node_modules/@tyrlabs-ai/resync/package.json");
+    if local_manifest.exists() {
+        bail!("obsolete npm RepoSync installation remains under the install prefix");
+    }
+    let nvm = home.join(".nvm/versions/node");
+    if let Ok(versions) = fs::read_dir(nvm) {
+        for version in versions.filter_map(|entry| entry.ok()) {
+            if version
+                .path()
+                .join("lib/node_modules/@tyrlabs-ai/resync/package.json")
+                .exists()
+            {
+                bail!("obsolete NVM RepoSync installation remains");
+            }
+        }
+    }
+    Ok(format!("{} ({fingerprint})", current.display()))
+}
+
 fn doctor() -> Value {
     let mut checks = Vec::new();
     let result = run_process(
@@ -910,6 +1255,12 @@ fn doctor() -> Value {
     checks.push(match rpc(&json!({ "method": "ping" }), None) {
         Ok(_) => json!({ "name": "daemon", "ok": true }),
         Err(error) => json!({ "name": "daemon", "ok": false, "detail": error.to_string() }),
+    });
+    checks.push(match single_build_health() {
+        Ok(detail) => json!({ "name": "single RepoSync build", "ok": true, "detail": detail }),
+        Err(error) => {
+            json!({ "name": "single RepoSync build", "ok": false, "detail": error.to_string() })
+        }
     });
     Value::Array(checks)
 }
@@ -995,7 +1346,7 @@ pub(crate) fn install_project_adapters_in_state(
                     marker_found = true;
                     return true;
                 }
-                !is_legacy_project_command(command, project_id)
+                !is_reposync_project_command(command)
             });
             !items.is_empty()
         });
@@ -1461,7 +1812,8 @@ fn absolute(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_invokes_git, is_project_sync_command, join_destination, reconciliation_messages,
+        command_invokes_git, is_project_sync_command, join_destination, prune_managed_builds,
+        reconciliation_messages, stage_managed_build,
     };
     use serde_json::json;
 
@@ -1473,6 +1825,30 @@ mod tests {
             join_destination(Some(&destination), outside_git.path())?,
             destination
         );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_upgrade_atomically_selects_one_build_and_prunes_old_versions() -> anyhow::Result<()>
+    {
+        let temporary = tempfile::tempdir()?;
+        let install_root = temporary.path().join("local");
+        let old = install_root.join("share/resync/bin/0.3.1/resync");
+        std::fs::create_dir_all(old.parent().unwrap())?;
+        std::fs::write(&old, b"obsolete")?;
+
+        let first = stage_managed_build(&std::env::current_exe()?, &install_root)?;
+        let second = stage_managed_build(&std::env::current_exe()?, &install_root)?;
+        assert_eq!(first.executable, second.executable);
+        assert_eq!(
+            std::fs::canonicalize(install_root.join("bin/resync"))?,
+            std::fs::canonicalize(&first.executable)?
+        );
+
+        let removed = prune_managed_builds(&install_root, &first.executable, &[])?;
+        assert_eq!(removed, vec![old.parent().unwrap().to_path_buf()]);
+        assert!(!old.exists());
+        assert!(first.executable.is_file());
         Ok(())
     }
 

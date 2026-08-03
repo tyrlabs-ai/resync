@@ -56,7 +56,15 @@ fn version_and_help_are_available() {
 #[test]
 fn npm_install_has_no_lifecycle_scripts() -> anyhow::Result<()> {
     let manifest: serde_json::Value = serde_json::from_str(include_str!("../package.json"))?;
-    assert!(manifest.get("scripts").is_none());
+    for lifecycle in [
+        "preinstall",
+        "install",
+        "postinstall",
+        "prepare",
+        "prepublish",
+    ] {
+        assert!(manifest["scripts"].get(lifecycle).is_none());
+    }
     Ok(())
 }
 
@@ -322,6 +330,131 @@ fn adapter_upgrade_migrates_versioned_hooks_to_a_stable_dispatcher() -> anyhow::
         fs::read(&hooks_path)?,
         approved_definition,
         "reinstalling RepoSync changed the approved hook definition"
+    );
+    Ok(())
+}
+
+#[test]
+fn adapter_repair_removes_every_reposync_hook_form_and_preserves_user_order() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let repository = root.path().join("project");
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .arg(&repository)
+        .status()?;
+    anyhow::ensure!(status.success(), "could not initialize test repository");
+    let project_id = "prj_all_hook_forms";
+    write_json(
+        &state.join("catalog.json"),
+        &LocalCatalog {
+            catalog_generation: 1,
+            projects: vec![local_project(project_id, repository.clone())],
+        },
+        0o600,
+    )?;
+    let stale_dispatcher = root
+        .path()
+        .join("old-state/hook-dispatchers/codex-deadbeef");
+    write_json(
+        &repository.join(".codex/hooks.json"),
+        &serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "*",
+                    "hooks": [
+                        { "type": "command", "command": "echo first" },
+                        {
+                            "type": "command",
+                            "command": format!("'{}'", stale_dispatcher.display())
+                        },
+                        {
+                            "type": "command",
+                            "command": format!(
+                                "'/home/test/.nvm/versions/node/24.18.0/bin/resync' codex-hook {project_id}"
+                            )
+                        },
+                        {
+                            "type": "command",
+                            "command": format!("resync codex-hook '{project_id}'")
+                        },
+                        { "type": "command", "command": "echo last" }
+                    ]
+                }],
+                "PostToolUse": [{
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": format!("'{}'", stale_dispatcher.display())
+                        },
+                        {
+                            "type": "command",
+                            "command": format!(
+                                "'/home/test/.nvm/versions/node/24.18.0/bin/resync' codex-hook '{project_id}'"
+                            )
+                        }
+                    ]
+                }]
+            }
+        }),
+        0o644,
+    )?;
+
+    let install = || {
+        Command::cargo_bin("resync")
+            .unwrap()
+            .env("RESYNC_STATE_DIR", &state)
+            .args(["install-adapters", project_id])
+            .assert()
+            .success()
+    };
+    install();
+    let hooks_path = repository.join(".codex/hooks.json");
+    let first_repair = fs::read(&hooks_path)?;
+    let hooks: serde_json::Value = serde_json::from_slice(&first_repair)?;
+    for event in ["PreToolUse", "PostToolUse"] {
+        let commands = hooks["hooks"][event]
+            .as_array()
+            .expect("hook groups")
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
+            .filter_map(|hook| hook["command"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.contains("hook-dispatchers/codex-"))
+                .count(),
+            1,
+            "exactly one RepoSync dispatcher must remain for {event}"
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| !command.contains("codex-hook"))
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| !command.contains("old-state"))
+        );
+        if event == "PreToolUse" {
+            let user_commands = commands
+                .iter()
+                .filter(|command| command.starts_with("echo "))
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(user_commands, ["echo first", "echo last"]);
+        }
+    }
+
+    install();
+    assert_eq!(
+        fs::read(hooks_path)?,
+        first_repair,
+        "repeated catalog repair must be byte-for-byte idempotent"
     );
     Ok(())
 }

@@ -60,6 +60,19 @@ pub struct TransactionRetention {
     pub debug_history: bool,
 }
 
+pub enum PreparedReconciliation {
+    Complete(Box<ReconcileResult>),
+    Ready(Box<PreparedInstall>),
+}
+
+pub struct PreparedInstall {
+    project_path: PathBuf,
+    previous_remote_oid: String,
+    target_remote_oid: String,
+    transaction: Transaction,
+    retention: TransactionRetention,
+}
+
 pub const DEBUG_HISTORY_MAX_RECORDS: usize = 128;
 pub const DEBUG_HISTORY_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -180,6 +193,12 @@ pub fn gc_transactions(
                 .entry(entry.transaction.project_path.clone())
                 .or_default()
                 .insert(format!("{}/{suffix}", entry.transaction.recovery_ref));
+        }
+        if entry.transaction.candidate.is_some() {
+            required_refs
+                .entry(entry.transaction.project_path.clone())
+                .or_default()
+                .insert(format!("{}/candidate", entry.transaction.recovery_ref));
         }
     }
     let mut prunable_refs = BTreeMap::<PathBuf, Vec<String>>::new();
@@ -403,7 +422,7 @@ fn write_recovery_refs(
 }
 
 fn delete_recovery_refs(project_path: &Path, prefix: &str) -> Result<()> {
-    for suffix in ["head", "index", "working"] {
+    for suffix in ["head", "index", "working", "candidate"] {
         git(
             project_path,
             ["update-ref", "-d", &format!("{prefix}/{suffix}")],
@@ -572,13 +591,13 @@ pub fn reconcile_workspace(
     )
 }
 
-pub fn reconcile_workspace_with_retention(
+pub fn prepare_reconciliation_with_retention(
     project_path: &Path,
     previous_remote_oid: &str,
     target_remote_oid: &str,
     transaction_root: Option<&Path>,
     retention: TransactionRetention,
-) -> Result<ReconcileResult> {
+) -> Result<PreparedReconciliation> {
     if previous_remote_oid.is_empty() || target_remote_oid.is_empty() {
         bail!("previousRemoteOid and targetRemoteOid are required");
     }
@@ -597,11 +616,13 @@ pub fn reconcile_workspace_with_retention(
     }
     let snapshot = capture_workspace(project_path)?;
     if previous_remote_oid == target_remote_oid {
-        return Ok(ReconcileResult {
-            outcome: "current".into(),
-            head: Some(snapshot.head),
-            ..empty_result()
-        });
+        return Ok(PreparedReconciliation::Complete(Box::new(
+            ReconcileResult {
+                outcome: "current".into(),
+                head: Some(snapshot.head),
+                ..empty_result()
+            },
+        )));
     }
     if !is_ancestor(project_path, previous_remote_oid, &snapshot.head)? {
         bail!("local HEAD does not descend from the last applied remote revision");
@@ -654,7 +675,7 @@ pub fn reconcile_workspace_with_retention(
     let temporary = tempdir()?;
     let temporary_path = temporary.path();
     let branch = format!("resync-candidate-{id}");
-    let outcome = (|| -> Result<ReconcileResult> {
+    let outcome = (|| -> Result<PreparedReconciliation> {
         git(
             project_path,
             [
@@ -725,13 +746,15 @@ pub fn reconcile_workspace_with_retention(
                 detail: detail.trim().into(),
             });
             write_json(&transaction.path, &transaction, 0o600)?;
-            return Ok(ReconcileResult {
-                outcome: "conflict".into(),
-                transaction_id: Some(id.clone()),
-                recovery_ref: Some(recovery_ref.clone()),
-                detail: Some(detail.trim().into()),
-                ..empty_result()
-            });
+            return Ok(PreparedReconciliation::Complete(Box::new(
+                ReconcileResult {
+                    outcome: "conflict".into(),
+                    transaction_id: Some(id.clone()),
+                    recovery_ref: Some(recovery_ref.clone()),
+                    detail: Some(detail.trim().into()),
+                    ..empty_result()
+                },
+            )));
         }
         let working_commit = rev(temporary_path, "HEAD")?;
         let index_commit = rev(temporary_path, "HEAD^")?;
@@ -749,29 +772,22 @@ pub fn reconcile_workspace_with_retention(
         if retention.debug_history {
             persist_debug_transaction(&transaction)?;
         }
-        if let Some(conflict) =
-            install_candidate(project_path, &mut transaction, &candidate, retention)?
-        {
-            transaction.phase = "CONFLICTED".into();
-            transaction.conflict = Some(conflict.clone());
-            write_json(&transaction.path, &transaction, 0o600)?;
-            return Ok(ReconcileResult {
-                outcome: "conflict".into(),
-                transaction_id: Some(id.clone()),
-                recovery_ref: Some(recovery_ref.clone()),
-                detail: Some(conflict.detail),
-                paths: conflict.paths,
-                ..empty_result()
-            });
-        }
-        Ok(ReconcileResult {
-            outcome: "applied".into(),
-            transaction_id: Some(id.clone()),
-            old_head: Some(snapshot.head.clone()),
-            new_head: Some(real_head),
-            changed_paths: changed_paths(project_path, previous_remote_oid, target_remote_oid)?,
-            ..empty_result()
-        })
+        git(
+            project_path,
+            [
+                "update-ref",
+                &format!("{recovery_ref}/candidate"),
+                &candidate.working_commit,
+            ],
+            RunOptions::default(),
+        )?;
+        Ok(PreparedReconciliation::Ready(Box::new(PreparedInstall {
+            project_path: project_path.to_owned(),
+            previous_remote_oid: previous_remote_oid.into(),
+            target_remote_oid: target_remote_oid.into(),
+            transaction: transaction.clone(),
+            retention,
+        })))
     })();
     let cleanup = RunOptions {
         allow_failure: true,
@@ -792,6 +808,99 @@ pub fn reconcile_workspace_with_retention(
         let _ = remove_transaction_artifacts(&transaction);
     }
     outcome
+}
+
+pub fn install_prepared_reconciliation(
+    prepared: PreparedReconciliation,
+) -> Result<ReconcileResult> {
+    let mut prepared = match prepared {
+        PreparedReconciliation::Complete(result) => return Ok(*result),
+        PreparedReconciliation::Ready(prepared) => *prepared,
+    };
+    let candidate = prepared
+        .transaction
+        .candidate
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("prepared reconciliation has no candidate"))?;
+    let snapshot = prepared.transaction.snapshot.clone();
+    let transaction_id = prepared.transaction.id.clone();
+    let recovery_ref = prepared.transaction.recovery_ref.clone();
+    let conflict = install_candidate(
+        &prepared.project_path,
+        &mut prepared.transaction,
+        &candidate,
+        prepared.retention,
+    )?;
+    if let Some(conflict) = conflict {
+        if conflict.kind == "install-rejected" {
+            prepared.transaction.phase = "RETRY".into();
+            prepared.transaction.completed_at = Some(Utc::now().to_rfc3339());
+            if prepared.retention.debug_history {
+                persist_debug_transaction(&prepared.transaction)?;
+            } else {
+                remove_transaction_artifacts(&prepared.transaction)?;
+            }
+            return Ok(ReconcileResult {
+                outcome: "retry".into(),
+                transaction_id: Some(transaction_id),
+                detail: Some(conflict.detail),
+                ..empty_result()
+            });
+        }
+        prepared.transaction.phase = "CONFLICTED".into();
+        prepared.transaction.conflict = Some(conflict.clone());
+        write_json(&prepared.transaction.path, &prepared.transaction, 0o600)?;
+        return Ok(ReconcileResult {
+            outcome: "conflict".into(),
+            transaction_id: Some(transaction_id),
+            recovery_ref: Some(recovery_ref),
+            detail: Some(conflict.detail),
+            paths: conflict.paths,
+            ..empty_result()
+        });
+    }
+    Ok(ReconcileResult {
+        outcome: "applied".into(),
+        transaction_id: Some(transaction_id),
+        old_head: Some(snapshot.head),
+        new_head: Some(candidate.real_head),
+        changed_paths: changed_paths(
+            &prepared.project_path,
+            &prepared.previous_remote_oid,
+            &prepared.target_remote_oid,
+        )?,
+        ..empty_result()
+    })
+}
+
+pub fn discard_prepared_reconciliation(prepared: PreparedReconciliation) -> Result<()> {
+    if let PreparedReconciliation::Ready(prepared) = prepared {
+        let mut prepared = *prepared;
+        prepared.transaction.phase = "RETRY".into();
+        prepared.transaction.completed_at = Some(Utc::now().to_rfc3339());
+        if prepared.retention.debug_history {
+            persist_debug_transaction(&prepared.transaction)?;
+        } else {
+            remove_transaction_artifacts(&prepared.transaction)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn reconcile_workspace_with_retention(
+    project_path: &Path,
+    previous_remote_oid: &str,
+    target_remote_oid: &str,
+    transaction_root: Option<&Path>,
+    retention: TransactionRetention,
+) -> Result<ReconcileResult> {
+    install_prepared_reconciliation(prepare_reconciliation_with_retention(
+        project_path,
+        previous_remote_oid,
+        target_remote_oid,
+        transaction_root,
+        retention,
+    )?)
 }
 
 fn rev(path: &Path, value: &str) -> Result<String> {

@@ -92,6 +92,12 @@ resync release LEASE_ID
 
 Ordinary `git commit` is the publication trigger; no RepoSync command is needed afterward. Use `resync project sync` to verify and leave reconciliation mode and `resync project publish` only to retry or flush publication manually. The daemon's Unix socket is mode `0600`; its state defaults to `~/.local/state/resync` and can be redirected with `RESYNC_STATE_DIR`.
 
+Run `resync upgrade` after installing a newer executable. It atomically selects
+one fingerprinted machine-local build, restarts and verifies the daemon against
+that exact fingerprint, repairs all catalog adapters, removes obsolete npm or
+Vite Plus installs, and prunes older cached builds only after no process refers
+to them. Re-running it is idempotent.
+
 Propagation is symmetric: a commit made in any enrolled checkout is published
 to its branch and fetched by every running machine daemon. An idle checkout is
 reconciled immediately in the background. If a participating tool call is
@@ -128,8 +134,8 @@ commands through this dispatcher.
 
 ## Correctness boundary
 
-- Fetching never changes the visible worktree.
-- A participating call holds a shared activity lease. Reconciliation holds an exclusive lease.
+- Fetching and immutable-object publication never change the visible worktree and never hold workspace exclusivity.
+- A participating call holds an idempotent activity lease. Reconciliation prepares privately, then holds exclusivity only for snapshot-validated installation; a waiting installer does not close tool admission.
 - Dirty tracked state is represented as two private synthetic commits, rebased in an isolated worktree, and installed only after the original workspace snapshot is reverified.
 - A failed rebase leaves the active branch, index, and working tree unchanged and retains recovery refs under `refs/resync/recovery/`.
 - A failed automatic rebase enters non-blocking reconciliation mode. Publication pauses, Git commands receive a concise reminder, and `resync project sync` explicitly verifies the resolution and exits the mode.

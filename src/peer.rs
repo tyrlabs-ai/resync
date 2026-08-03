@@ -51,13 +51,14 @@ fn remote_home_path(relative: &str) -> String {
 
 fn remote_install_script(remote: &str) -> String {
     format!(
-        "set -eu\nchmod 755 {}\nmv {} {}\nmkdir -p {}\nln -sfn {} {}\n",
+        "set -eu\nchmod 755 {}\nmv {} {}\nmkdir -p {}\nln -sfn {} {}\n{} upgrade >/dev/null\n",
         remote_home_path(&format!("{remote}.tmp")),
         remote_home_path(&format!("{remote}.tmp")),
         remote_home_path(remote),
         remote_home_path(".local/bin"),
         remote_home_path(remote),
-        remote_home_path(".local/bin/resync")
+        remote_home_path(".local/bin/resync"),
+        remote_home_path(remote)
     )
 }
 
@@ -193,9 +194,11 @@ fn release_binary(target: &str) -> Result<Vec<u8>> {
 fn install_remote_binary(host: &str) -> Result<String> {
     let target = remote_target(host)?;
     let binary = release_binary(&target)?;
+    let fingerprint = format!("{:x}", Sha256::digest(&binary));
     let remote = format!(
-        ".local/share/resync/bin/{}/resync",
-        env!("CARGO_PKG_VERSION")
+        ".local/share/resync/bin/{}-{}/resync",
+        env!("CARGO_PKG_VERSION"),
+        &fingerprint[..16]
     );
     let directory = remote.rsplit_once('/').unwrap().0;
     run(
@@ -540,6 +543,9 @@ mod tests {
             "ln -sfn \"$HOME\"/'.local/share/resync/bin/0.2.0/resync' \
              \"$HOME\"/'.local/bin/resync'"
         ));
+        assert!(
+            script.contains("\"$HOME\"/'.local/share/resync/bin/0.2.0/resync' upgrade >/dev/null")
+        );
     }
 
     #[test]

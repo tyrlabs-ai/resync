@@ -4,7 +4,8 @@ use common::{advance_remote, fixture, rev};
 use resync::git_state::capture_workspace;
 use resync::process::{RunOptions, git};
 use resync::transaction::{
-    TransactionRetention, gc_transactions, reconcile_workspace, reconcile_workspace_with_retention,
+    TransactionRetention, gc_transactions, install_prepared_reconciliation,
+    prepare_reconciliation_with_retention, reconcile_workspace, reconcile_workspace_with_retention,
     recover_transaction,
 };
 use std::collections::BTreeSet;
@@ -166,6 +167,32 @@ fn rewritten_remote_history_is_rejected_before_mutation() -> anyhow::Result<()> 
 }
 
 #[test]
+fn installation_retries_if_workspace_changes_after_preparation() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let target = advance_remote(&fixture, "remote\n")?;
+    let transactions = fixture.root.path().join("transactions");
+    let prepared = prepare_reconciliation_with_retention(
+        &fixture.local,
+        &fixture.base,
+        &target,
+        Some(&transactions),
+        TransactionRetention::default(),
+    )?;
+
+    fs::write(fixture.local.join("file"), "concurrent local edit\n")?;
+    let changed = capture_workspace(&fixture.local)?;
+    let result = install_prepared_reconciliation(prepared)?;
+
+    assert_eq!(result.outcome, "retry");
+    assert_eq!(capture_workspace(&fixture.local)?, changed);
+    assert_eq!(
+        fs::read_to_string(fixture.local.join("file"))?,
+        "concurrent local edit\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn debug_transaction_history_is_bounded_to_128_records() -> anyhow::Result<()> {
     let fixture = fixture()?;
     let transactions = fixture.root.path().join("transactions");
@@ -248,7 +275,7 @@ fn transaction_gc_compacts_retained_legacy_snapshots() -> anyhow::Result<()> {
     )?
     .stdout;
     assert!(!refs.contains("orphan"));
-    assert_eq!(refs.lines().count(), 3);
+    assert_eq!(refs.lines().count(), 4);
     Ok(())
 }
 

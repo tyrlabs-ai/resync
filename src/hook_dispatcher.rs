@@ -86,27 +86,42 @@ fn ensure_dispatcher(
     Ok(dispatcher)
 }
 
-pub(crate) fn is_legacy_project_command(command: &str, project_id: &str) -> bool {
-    let suffix = format!(" codex-hook {}", shell_quote(project_id));
-    let Some(executable) = command.strip_suffix(&suffix) else {
-        return false;
-    };
-    Path::new(executable.trim_matches(['\'', '"']))
-        .file_name()
-        .and_then(|value| value.to_str())
-        == Some("resync")
+fn unquoted(value: &str) -> &str {
+    value.trim().trim_matches(['\'', '"'])
 }
 
-pub(crate) fn is_legacy_workspace_command(command: &str, manifest_path: &Path) -> bool {
-    let suffix = format!(
-        " codex-workspace-hook {}",
-        shell_quote(&manifest_path.to_string_lossy())
-    );
-    let Some(executable) = command.strip_suffix(&suffix) else {
+fn is_dispatcher_command(command: &str, prefix: &str) -> bool {
+    let path = Path::new(unquoted(command));
+    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
     };
-    Path::new(executable.trim_matches(['\'', '"']))
+    file_name.starts_with(prefix)
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            == Some("hook-dispatchers")
+}
+
+fn invokes_resync_subcommand(command: &str, subcommand: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let Some(executable) = words.next() else {
+        return false;
+    };
+    Path::new(unquoted(executable))
         .file_name()
         .and_then(|value| value.to_str())
         == Some("resync")
+        && words.next() == Some(subcommand)
+}
+
+pub(crate) fn is_reposync_project_command(command: &str) -> bool {
+    (is_dispatcher_command(command, "codex-")
+        && !is_dispatcher_command(command, "codex-workspace-"))
+        || invokes_resync_subcommand(command, "codex-hook")
+}
+
+pub(crate) fn is_reposync_workspace_command(command: &str) -> bool {
+    is_dispatcher_command(command, "codex-workspace-")
+        || invokes_resync_subcommand(command, "codex-workspace-hook")
 }
