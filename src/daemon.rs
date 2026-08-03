@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
+use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1605,6 +1606,23 @@ fn daemon_matches_client(ping: &Value, client_binary_id: &str) -> bool {
     ping.get("binaryId").and_then(Value::as_str) == Some(client_binary_id)
 }
 
+fn daemon_matches_exact_executable(
+    ping: &Value,
+    client_binary_id: &str,
+    client_executable: &Path,
+) -> bool {
+    if !daemon_matches_client(ping, client_binary_id) {
+        return false;
+    }
+    let Some(pid) = ping.get("pid").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Ok(daemon_executable) = fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    fs::canonicalize(daemon_executable).ok() == fs::canonicalize(client_executable).ok()
+}
+
 fn terminate_stale_daemon(ping: &Value) -> Result<()> {
     let pid = ping
         .get("pid")
@@ -1660,22 +1678,43 @@ pub(crate) fn ensure_daemon_supervision(restart: bool) -> Result<&'static str> {
             let directory = home.join(".config/systemd/user");
             fs::create_dir_all(&directory)?;
             let executable = std::env::current_exe()?;
-            fs::write(
-                directory.join("resync.service"),
-                format!(
-                    "[Unit]\nDescription=RepoSync convergence daemon\nAfter=network-online.target\n\n[Service]\nExecStart={} daemon\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
-                    executable.display()
-                ),
-            )?;
+            let unit_path = directory.join("resync.service");
+            let unit = format!(
+                "[Unit]\nDescription=RepoSync convergence daemon\nAfter=network-online.target\n\n[Service]\nExecStart={} daemon\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+                executable.display()
+            );
+            let unit_changed = fs::read_to_string(&unit_path).ok().as_deref() != Some(&unit);
+            if unit_changed {
+                fs::write(&unit_path, unit)?;
+                run(
+                    "systemctl",
+                    ["--user", "daemon-reload"],
+                    RunOptions::default(),
+                )?;
+            }
+            let service_active = run(
+                "systemctl",
+                ["--user", "is-active", "--quiet", "resync.service"],
+                RunOptions {
+                    allow_failure: true,
+                    ..RunOptions::default()
+                },
+            )?
+            .code
+                == 0;
+            let exact_daemon = crate::rpc::rpc(&json!({ "method": "ping" }), None)
+                .ok()
+                .is_some_and(|ping| {
+                    executable_fingerprint().is_ok_and(|binary_id| {
+                        daemon_matches_exact_executable(&ping, &binary_id, &executable)
+                    })
+                });
             run(
                 "systemctl",
-                ["--user", "daemon-reload"],
-                RunOptions::default(),
-            )?;
-            run(
-                "systemctl",
-                if restart {
+                if restart && (!service_active || !exact_daemon) {
                     vec!["--user", "restart", "resync.service"]
+                } else if service_active {
+                    vec!["--user", "enable", "resync.service"]
                 } else {
                     vec!["--user", "enable", "--now", "resync.service"]
                 },
@@ -1764,7 +1803,10 @@ pub fn daemon_rpc(request: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LeaseGate, ResyncDaemon, daemon_matches_client, repair_adapters_for_build};
+    use super::{
+        LeaseGate, ResyncDaemon, daemon_matches_client, daemon_matches_exact_executable,
+        repair_adapters_for_build,
+    };
     use crate::state::{Config, LocalCatalog, LocalProject, StatePaths, read_json};
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1844,6 +1886,32 @@ mod tests {
             "current"
         ));
         assert!(!daemon_matches_client(&json!({ "pid": 42 }), "current"));
+    }
+
+    #[test]
+    fn exact_running_daemon_does_not_require_upgrade_restart() -> anyhow::Result<()> {
+        let executable = std::env::current_exe()?;
+        let ping = json!({
+            "binaryId": "current",
+            "pid": std::process::id()
+        });
+
+        assert!(daemon_matches_exact_executable(
+            &ping,
+            "current",
+            &executable
+        ));
+        assert!(!daemon_matches_exact_executable(
+            &ping,
+            "different",
+            &executable
+        ));
+        assert!(!daemon_matches_exact_executable(
+            &ping,
+            "current",
+            &executable.with_extension("other")
+        ));
+        Ok(())
     }
 
     #[tokio::test]
