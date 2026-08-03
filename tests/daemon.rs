@@ -53,7 +53,7 @@ fn access_leases_are_idempotent_and_expiry_cleans_every_index() -> anyhow::Resul
             projects: vec![project],
         },
         Duration::from_secs(10),
-        Duration::from_millis(25),
+        Duration::from_secs(2),
     )?;
     let runtime = resync::daemon::runtime()?;
     runtime.block_on(async {
@@ -82,7 +82,7 @@ fn access_leases_are_idempotent_and_expiry_cleans_every_index() -> anyhow::Resul
         );
 
         let expiring = daemon.handle(request.clone()).await?;
-        tokio::time::sleep(Duration::from_millis(75)).await;
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
         assert_eq!(
             daemon
                 .handle(serde_json::json!({
