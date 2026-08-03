@@ -307,6 +307,33 @@ pub fn release(
     mutate_active_receipt(project, lease_id, holder_id, "release", None)
 }
 
+pub fn active_receipt(
+    project: &NamedLeaseProject,
+    lease_id: &str,
+    holder_id: &str,
+) -> Result<Option<NamedLeaseReceipt>> {
+    validate_identifier(lease_id, "lease", "nls_")?;
+    validate_holder_id(holder_id)?;
+    let path = active_receipt_path(&receipt_project_directory(project), lease_id, holder_id);
+    let receipt: Option<NamedLeaseReceipt> = crate::state::read_json(&path, None)?;
+    receipt
+        .map(|receipt| {
+            validate_receipt_binding(&receipt, project, lease_id, holder_id)?;
+            Ok(receipt)
+        })
+        .transpose()
+}
+
+pub fn next_renewal_at(lease: &NamedLease) -> DateTime<Utc> {
+    let lifetime = lease.expires_at - lease.acquired_at;
+    let lifetime_millis = lifetime.num_milliseconds().max(1);
+    let jitter_window = (lifetime_millis / 15).max(1);
+    let digest = Sha256::digest(lease.lease_id.as_bytes());
+    let sample = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 has eight bytes"));
+    let jitter = i64::try_from(sample % u64::try_from(jitter_window).unwrap_or(1)).unwrap_or(0);
+    lease.acquired_at + chrono::Duration::milliseconds(lifetime_millis / 3 + jitter)
+}
+
 fn mutate_active_receipt(
     project: &NamedLeaseProject,
     lease_id: &str,
@@ -682,5 +709,8 @@ mod tests {
             .to_utc();
         assert!(receipt_is_locally_expired(&receipt, now));
         assert!(receipt.lease.is_some());
+        let renewal = next_renewal_at(receipt.lease.as_ref().unwrap());
+        assert!(renewal > receipt.lease.as_ref().unwrap().acquired_at);
+        assert!(renewal < receipt.lease.as_ref().unwrap().expires_at);
     }
 }

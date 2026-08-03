@@ -264,6 +264,105 @@ fn named_lease_acquire_persists_pending_before_transport_and_active_before_outpu
 }
 
 #[test]
+fn named_lease_contention_is_json_on_stdout_with_exit_three() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let origin = format!("http://{}", listener.local_addr()?);
+    let project_id = "prj_cli_contention";
+    let mut project = local_project(project_id, root.path().join("not-a-checkout"));
+    project.service = Some(origin.clone());
+    write_json(
+        &state.join("catalog.json"),
+        &LocalCatalog {
+            catalog_generation: 1,
+            projects: vec![project],
+        },
+        0o600,
+    )?;
+    write_json(
+        &state.join("credentials.json"),
+        &serde_json::json!({
+            "version": 1,
+            "providers": {
+                origin.clone(): {
+                    "token": "test-device-token",
+                    "updatedAt": "2026-08-03T00:00:00Z"
+                }
+            }
+        }),
+        0o600,
+    )?;
+    let server_origin = origin.clone();
+    let server = thread::spawn(move || -> anyhow::Result<()> {
+        let (mut discovery, _) = listener.accept()?;
+        read_http_request(&mut discovery)?;
+        serve_response(
+            &mut discovery,
+            "200 OK",
+            &serde_json::json!({
+                "protocol": "resync.v1",
+                "service_id": "svc_test",
+                "capabilities": ["project-named-leases-v1"],
+                "endpoints": {
+                    "named_leases": format!("{server_origin}/v1/projects/{{project_id}}/named-leases")
+                },
+                "named_lease_policy": {
+                    "default_ttl_seconds": 900,
+                    "min_ttl_seconds": 30,
+                    "max_ttl_seconds": 3600
+                }
+            })
+            .to_string(),
+        )?;
+        let (mut acquire, _) = listener.accept()?;
+        read_http_request(&mut acquire)?;
+        serve_response(
+            &mut acquire,
+            "409 Conflict",
+            &serde_json::json!({
+                "outcome": "HELD",
+                "lease": {
+                    "lease_id": "nls_existing",
+                    "project_id": project_id,
+                    "resource_key": "waykeeper/maps/map/tickets/ticket",
+                    "holder_device_id": "dev_other",
+                    "holder_id": "worker-other",
+                    "generation": 4,
+                    "acquired_at": "2026-08-03T00:00:00Z",
+                    "expires_at": "2026-08-03T00:15:00Z"
+                }
+            })
+            .to_string(),
+        )?;
+        Ok(())
+    });
+    let assertion = Command::cargo_bin("resync")
+        .unwrap()
+        .env("RESYNC_STATE_DIR", &state)
+        .args([
+            "lease",
+            "acquire",
+            "waykeeper/maps/map/tickets/ticket",
+            "--project",
+            project_id,
+            "--holder",
+            "worker-a",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("\"outcome\": \"HELD\""))
+        .stderr(predicate::str::contains("HELD"));
+    server.join().unwrap()?;
+    let stdout = String::from_utf8(assertion.get_output().stdout.clone())?;
+    let stderr = String::from_utf8(assertion.get_output().stderr.clone())?;
+    assert!(!stdout.contains("holder_secret"));
+    assert!(!stderr.contains("holder_secret"));
+    assert!(json_files(&state.join("named-leases"))?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn npm_install_has_no_lifecycle_scripts() -> anyhow::Result<()> {
     let manifest: serde_json::Value = serde_json::from_str(include_str!("../package.json"))?;
     for lifecycle in [
