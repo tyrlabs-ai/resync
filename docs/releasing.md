@@ -62,14 +62,19 @@ The tag workflow does not publish to npm.
 
 ## 3. Publish to npm manually
 
-Use an npm maintainer account with account-level 2FA enabled. Authenticate
-interactively; never put a publishing token in the repository or GitHub
-Actions.
+Use an npm maintainer account with account-level 2FA enabled. Never put a
+publishing token in the repository or GitHub Actions. Start the publisher
+directly: npm performs authentication as part of each publish and presents its
+passkey/security-key challenge when proof of presence is required.
 
 ```sh
-npm login --auth-type=web
 ./scripts/publish-npm-release.sh vX.Y.Z
 ```
+
+Do not start a separate browser-login flow merely as a publish preflight. If
+npm prints an approval URL, keep the publisher running and open that URL in the
+user's external browser; passkey and hardware-key prompts cannot be completed
+in an agent-only integrated browser.
 
 The script:
 

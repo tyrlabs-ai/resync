@@ -64,8 +64,6 @@ install -m 755 "$dist_dir/resync-aarch64-unknown-linux-gnu" "$source_dir/npm/lin
 install -m 755 "$dist_dir/resync-x86_64-apple-darwin" "$source_dir/npm/darwin-x64/bin/resync"
 install -m 755 "$dist_dir/resync-aarch64-apple-darwin" "$source_dir/npm/darwin-arm64/bin/resync"
 
-npm whoami >/dev/null
-
 publish_package() {
   local package_dir="$1"
   local package_name
