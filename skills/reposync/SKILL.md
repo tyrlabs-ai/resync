@@ -23,6 +23,21 @@ Use `resync <ssh-target>` to enroll another SSH machine into the same project th
 
 Use `resync -h` and the `-h` or `--help` option at any command level to inspect the installed CLI rather than guessing an option.
 
+## Upgrade or repair multiple machines
+
+For Linux and Yolopod deployments, use the checksum-verified static artifact
+created by the tagged GitHub `Release` workflow. Never copy a local
+`cargo build --release` binary to another machine: it can require the local
+builder's glibc, and its version string does not identify the exact build.
+Machines of the same architecture must receive the same release artifact.
+
+Run that downloaded artifact's `resync upgrade` command on each machine. Then
+verify `resync --version`, `resync doctor`, the canonical launcher and daemon
+executable, and the executable SHA-256 against the release's `SHA256SUMS`.
+Confirm that no older managed cache or npm/global installation remains and
+re-run the upgrade to prove it is idempotent. The complete maintainer procedure
+is in `docs/releasing.md` in the RepoSync source repository.
+
 ## Reconciliation mode
 
 If RepoSync reports reconciliation mode, the workspace remains available but
