@@ -1,6 +1,6 @@
 {
   "name": "@tyrlabs-ai/resync-darwin-x64",
-  "version": "0.3.8",
+  "version": "0.4.0",
   "description": "RepoSync native binary for macOS on Intel",
   "files": ["bin/resync"],
   "os": ["darwin"],
